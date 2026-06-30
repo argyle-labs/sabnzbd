@@ -1,9 +1,0 @@
-services:
-  sabnzbd:
-    image: ghcr.io/scottdkey/sabnzbd:latest
-    container_name: sabnzbd
-    restart: unless-stopped
-    ports:
-      - "8080:8080"
-    volumes:
-      - /opt/sabnzbd/config:/config
