@@ -2,6 +2,10 @@
 name = "sabnzbd"
 version = "0.1.0"
 edition = "2021"
+description = "SABnzbd usenet client — orca service-backend"
+
+[package.metadata.orca]
+category = "downloads"
 
 [lib]
 name = "sabnzbd"
