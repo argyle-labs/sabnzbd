@@ -1,0 +1,29 @@
+# SABnzbd - Usenet Downloader
+# docs: ../../docs/services/sabnzbd.md
+
+services:
+  sabnzbd:
+    image: lscr.io/linuxserver/sabnzbd:${SABNZBD_IMAGE_TAG:-latest}
+    container_name: sabnzbd
+    environment:
+      - PUID=${PUID:-99}
+      - PGID=${PGID:-100}
+      - TZ=${TZ:-America/Denver}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    ports:
+      - "8080:8080"
+    volumes:
+      - ${SABNZBD_CONFIG_PATH:-/opt/appdata/sabnzbd}:/config
+      - ${DOWNLOADS_PATH:-/mnt/pool/downloads}:/downloads
+    networks:
+      - media
+    restart: unless-stopped
+
+networks:
+  media:
+    external: true
