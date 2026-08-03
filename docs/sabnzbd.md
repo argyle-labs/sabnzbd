@@ -1,49 +1,55 @@
 # SABnzbd
 
-Usenet downloader.
+Web-based Usenet (NZB) client.
 
-- **Host**: <host> — see [Network Map](../network/network-map.md)
-- **Port**: 8080
-- **Image**: `lscr.io/linuxserver/sabnzbd`
-- **Compose**: [compose/sabnzbd/docker-compose.yml](../../compose/sabnzbd/docker-compose.yml)
-- **Network**: `media`
-- **VPN**: All traffic routes through <vpn-provider> region-a via OPNsense. Killswitch blocks internet if VPN is down.
+- **Port**: `8080` (web UI)
+- **Image**: `lscr.io/linuxserver/sabnzbd:latest`
+- **Compose**: [../compose.yml](../compose.yml)
+- **Upstream**: <https://sabnzbd.org/>
 
-## Deploy
+## Run
 
-Deployed as a Portainer Git stack pointing at the `main` branch. Portainer polls GitHub every 5 minutes and redeploys on changes.
+See the [README](../README.md) for Docker Compose, Podman, LXC, VM, and Unraid
+instructions. In short:
 
-To manually redeploy: Portainer → Stacks → sabnzbd → Pull and redeploy.
+```sh
+docker compose up -d
+```
+
+The web UI is then available on port `8080`.
 
 ## Volumes
 
-| Host Path | Container Path | Description |
-|-----------|---------------|-------------|
-| `/opt/appdata/sabnzbd` | `/config` | SABnzbd config |
-| `/mnt/<host>/downloads/incomplete` | `/downloads/incomplete` | In-progress downloads (NFS) |
-| `/mnt/<host>/downloads/completed` | `/downloads/completed` | Finished downloads (NFS) |
+| Container Path | Description |
+|----------------|-------------|
+| `/config` | SABnzbd configuration and state |
+| `/downloads` | Working directory for in-progress and completed NZB content |
 
-NFS mounts on <host> are defined in `/etc/fstab` and managed by the `netmount` OpenRC service. See [nfs-alpine.md](../host-setup/nfs-alpine.md).
+Map both to persistent host paths (or named volumes). The `/config` volume holds
+the entire service state — back it up.
 
 ## Environment Variables
 
-| Variable                    | Default          | Description               |
-|-----------------------------|------------------|---------------------------|
-| `TZ`                        | `Etc/UTC` | Timezone                  |
-| `PUID` / `PGID`             | `1000`           | User/group ID             |
-| `SABNZBD_IMAGE_TAG`         | `latest`         | Image tag                 |
-| `SABNZBD_CONFIG_PATH`       | `./config`       | Config directory          |
-| `DOWNLOADS_INCOMPLETE_PATH` | *(required)*     | Incomplete downloads path |
-| `DOWNLOADS_COMPLETED_PATH`  | *(required)*     | Completed downloads path  |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TZ` | `Etc/UTC` | Timezone |
+| `PUID` / `PGID` | `1000` | User/group ID the container runs as |
+
+Consult the [linuxserver.io image docs](https://docs.linuxserver.io/images/docker-sabnzbd/)
+for the full set of supported variables and tags.
+
+## Backup & restore
+
+Back up the `/config` volume — that is the whole service state. Stop the
+container first for a clean copy, then restore by putting the volume back and
+starting the container again.
 
 ## Troubleshooting
 
-```bash
+```sh
+# Container logs
 docker logs sabnzbd
 
-# Check NFS mounts are active
-mount | grep <host>
-
-# Test write access
-touch /mnt/<host>/downloads/completed/test && rm /mnt/<host>/downloads/completed/test
+# Confirm the web UI is reachable
+curl -fsS http://localhost:8080/ >/dev/null && echo ok
 ```

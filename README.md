@@ -4,7 +4,7 @@
 
 # sabnzbd
 
-SABnzbd is a web-based Usenet (NZB) binary downloader.
+SABnzbd is a web-based Usenet (NZB) client.
 
 A first-party [orca](https://github.com/argyle-labs/orca) plugin (service-backend).
 
