@@ -40,12 +40,12 @@ categories, so it is safe to attach to every category / all torrents.
 
 ## Per-server scan APIs
 
-- **Audiobookshelf** (`http://10.10.10.6:13378`): `POST /login` → `user.token`,
+- **Audiobookshelf** (`http://10.0.0.6:13378`): `POST /login` → `user.token`,
   then `POST /api/libraries/{id}/scan` (Bearer). Libs: Audiobooks
   `d1d6751d-cf80-4746-b301-c03b3ae1fe89`, podcasts `13ba8800-1315-4363-84e2-7956fa118d23`.
-- **Komga** (`http://10.10.10.6:25600`): Basic auth, `POST /api/v1/libraries/{id}/scan`.
+- **Komga** (`http://10.0.0.6:25600`): Basic auth, `POST /api/v1/libraries/{id}/scan`.
   Libs: comics `0PS084DCHJ1HH`, manga `0PS0877ZDJ0AZ`.
-- **Kavita** (`http://10.10.10.6:5000`): `POST /api/Account/login` → JWT, then
+- **Kavita** (`http://10.0.0.6:5000`): `POST /api/Account/login` → JWT, then
   `POST /api/Library/scan?libraryId={id}`. Libs: Books `2`, Comics `1`.
 - **Navidrome** (music): Subsonic `startScan` — see navidrome docs (wired via Lidarr, not this dispatcher).
 - **Calibre-Web**: no scan API — it reads the Calibre DB live. New books appear
