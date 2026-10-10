@@ -308,12 +308,12 @@ mod tests {
     }
 
     async fn sab(servers: Value, warnings: Value) -> (wiremock::MockServer, SabClient) {
-        use wiremock::matchers::{method, path, query_param};
+        use wiremock::matchers::{body_string_contains, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let s = MockServer::start().await;
-        Mock::given(method("GET"))
+        Mock::given(method("POST"))
             .and(path("/api"))
-            .and(query_param("mode", "get_config"))
+            .and(body_string_contains("mode=get_config"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(
                     plugin_toolkit::serde_json::json!({"config": {"servers": servers}}),
@@ -321,18 +321,18 @@ mod tests {
             )
             .mount(&s)
             .await;
-        Mock::given(method("GET"))
+        Mock::given(method("POST"))
             .and(path("/api"))
-            .and(query_param("mode", "warnings"))
+            .and(body_string_contains("mode=warnings"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(plugin_toolkit::serde_json::json!({"warnings": warnings})),
             )
             .mount(&s)
             .await;
-        Mock::given(method("GET"))
+        Mock::given(method("POST"))
             .and(path("/api"))
-            .and(query_param("mode", "set_config"))
+            .and(body_string_contains("mode=set_config"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(plugin_toolkit::serde_json::json!({"status": true})),
@@ -348,7 +348,7 @@ mod tests {
             .await
             .unwrap()
             .iter()
-            .filter(|r| r.url.query().unwrap_or("").contains("mode=set_config"))
+            .filter(|r| String::from_utf8_lossy(&r.body).contains("mode=set_config"))
             .count()
     }
 
@@ -384,7 +384,7 @@ mod tests {
 
     #[tokio::test]
     async fn servers_sync_reports_a_partial_apply() {
-        use wiremock::matchers::{method, path, query_param};
+        use wiremock::matchers::{body_string_contains, method, path};
         use wiremock::{Mock, ResponseTemplate};
         let (s, c) = sab(
             plugin_toolkit::serde_json::json!([
@@ -394,10 +394,10 @@ mod tests {
             plugin_toolkit::serde_json::json!([]),
         )
         .await;
-        Mock::given(method("GET"))
+        Mock::given(method("POST"))
             .and(path("/api"))
-            .and(query_param("mode", "set_config"))
-            .and(query_param("keyword", "a"))
+            .and(body_string_contains("mode=set_config"))
+            .and(body_string_contains("keyword=a"))
             .respond_with(ResponseTemplate::new(200).set_body_json(
                 plugin_toolkit::serde_json::json!({"status": false, "error": "nope"}),
             ))

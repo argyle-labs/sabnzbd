@@ -1,4 +1,6 @@
-//! SABnzbd API client (`/api?mode=...&output=json&apikey=...`).
+//! SABnzbd API client: form-encoded POSTs to `/api`. The API key travels in
+//! the body (SABnzbd reads `apikey` from query or form, never a header), so it
+//! never appears in a URL or in an error that quotes one.
 
 use plugin_toolkit::http::Client as HttpClient;
 use plugin_toolkit::prelude::*;
@@ -8,17 +10,6 @@ pub struct SabClient {
     http: HttpClient,
     base: String,
     api_key: String,
-}
-
-fn encode(s: &str) -> String {
-    s.bytes()
-        .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                (b as char).to_string()
-            }
-            b => format!("%{b:02X}"),
-        })
-        .collect()
 }
 
 impl SabClient {
@@ -33,32 +24,39 @@ impl SabClient {
     /// One API call. SABnzbd reports failures as `{"status": false, "error": ...}`
     /// with HTTP 200, so that shape is an error too.
     pub async fn api(&self, mode: &str, params: &[(&str, &str)]) -> Result<Value> {
-        let mut url = format!(
-            "{}/api?mode={}&output=json&apikey={}",
-            self.base,
-            encode(mode),
-            encode(&self.api_key)
-        );
-        for (k, v) in params {
-            url.push_str(&format!("&{}={}", encode(k), encode(v)));
-        }
+        let mut form: Vec<(String, String)> = vec![
+            ("mode".into(), mode.into()),
+            ("output".into(), "json".into()),
+            ("apikey".into(), self.api_key.clone()),
+        ];
+        form.extend(params.iter().map(|(k, v)| (k.to_string(), v.to_string())));
         let resp = self
             .http
-            .get(url)
+            .post(format!("{}/api", self.base))
+            .form(form)
             .send()
             .await
-            .map_err(|e| anyhow!("sabnzbd {mode}: {e}"))?;
+            .map_err(|e| anyhow!("sabnzbd {mode}: {}", self.scrub(&e.to_string())))?;
         let v: Value = resp
             .json()
-            .map_err(|e| anyhow!("sabnzbd {mode}: decode: {e}"))?;
+            .map_err(|e| anyhow!("sabnzbd {mode}: decode: {}", self.scrub(&e.to_string())))?;
         if v.get("status") == Some(&Value::Bool(false)) {
             let err = v
                 .get("error")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown error");
-            bail!("sabnzbd {mode}: {err}");
+            bail!("sabnzbd {mode}: {}", self.scrub(err));
         }
         Ok(v)
+    }
+
+    /// `text` with the API key replaced, in case a server or transport error
+    /// echoes the request.
+    fn scrub(&self, text: &str) -> String {
+        if self.api_key.is_empty() {
+            return text.to_string();
+        }
+        text.replace(&self.api_key, "<redacted>")
     }
 
     pub async fn config_section(&self, section: &str) -> Result<Value> {
@@ -104,34 +102,34 @@ impl SabClient {
 mod tests {
     use super::*;
     use plugin_toolkit::serde_json::json;
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
     async fn api_sends_key_and_params_and_surfaces_errors() {
         let s = MockServer::start().await;
-        Mock::given(method("GET"))
+        Mock::given(method("POST"))
             .and(path("/api"))
-            .and(query_param("mode", "get_config"))
-            .and(query_param("section", "misc"))
-            .and(query_param("apikey", "k y"))
+            .and(body_string_contains("mode=get_config"))
+            .and(body_string_contains("section=misc"))
+            .and(body_string_contains("apikey=k+y"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(json!({"config": {"misc": {"download_dir": "/incomplete"}}})),
             )
             .mount(&s)
             .await;
-        Mock::given(method("GET"))
+        Mock::given(method("POST"))
             .and(path("/api"))
-            .and(query_param("mode", "warnings"))
+            .and(body_string_contains("mode=warnings"))
             .respond_with(ResponseTemplate::new(200).set_body_json(
                 json!({"warnings": ["old style", {"text": "new style", "type": "WARNING"}]}),
             ))
             .mount(&s)
             .await;
-        Mock::given(method("GET"))
+        Mock::given(method("POST"))
             .and(path("/api"))
-            .and(query_param("mode", "set_config"))
+            .and(body_string_contains("mode=set_config"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(json!({"status": false, "error": "API Key Incorrect"})),
@@ -144,5 +142,45 @@ mod tests {
         assert_eq!(c.warnings().await.unwrap(), vec!["old style", "new style"]);
         let err = c.set_server_connections("eweka", 20).await.unwrap_err();
         assert!(err.to_string().contains("API Key Incorrect"));
+    }
+
+    #[tokio::test]
+    async fn errors_never_carry_the_api_key() {
+        // Nothing listens on port 9 here: a refused connection.
+        let c = SabClient::new("http://127.0.0.1:9", "s3cr3t-key");
+        let err = c.warnings().await.unwrap_err().to_string();
+        assert!(!err.contains("s3cr3t-key"), "{err}");
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"status": false, "error": "bad key s3cr3t-key"})),
+            )
+            .mount(&s)
+            .await;
+        let err = SabClient::new(&s.uri(), "s3cr3t-key")
+            .warnings()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !err.contains("s3cr3t-key") && err.contains("<redacted>"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_key_goes_in_the_body_not_the_url() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"warnings": []})))
+            .mount(&s)
+            .await;
+        SabClient::new(&s.uri(), "k").warnings().await.unwrap();
+        let req = &s.received_requests().await.unwrap()[0];
+        assert!(req.url.query().is_none());
+        assert!(String::from_utf8_lossy(&req.body).contains("apikey=k"));
     }
 }
