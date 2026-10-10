@@ -2,9 +2,7 @@
 //! the body (SABnzbd reads `apikey` from query or form, never a header), so it
 //! never appears in a URL or in an error that quotes one.
 //!
-//! Every error text passes through [`SabClient::scrub`]: the API key and any
-//! sensitive value seen in a `get_config` reply (server passwords) are replaced
-//! by exact match, then the stack-wide pattern scrub runs.
+//! Every error text passes through [`SabClient::scrub`].
 
 use std::sync::Mutex;
 
@@ -60,13 +58,15 @@ impl SabClient {
         Ok(v)
     }
 
-    /// `text` with every known secret replaced, in case a server or transport
-    /// error echoes the request or a config value.
+    /// `text` with the API key and every sensitive `get_config` value (server
+    /// passwords) replaced by exact match, then the stack-wide pattern scrub.
+    /// Values under 4 chars or SABnzbd's all-asterisk masks are skipped: they
+    /// would redact ordinary text.
     pub fn scrub(&self, text: &str) -> String {
         let mut out = text.to_string();
         let seen = self.seen_secrets.lock().unwrap_or_else(|e| e.into_inner());
         for secret in std::iter::once(&self.api_key).chain(seen.iter()) {
-            if !secret.is_empty() {
+            if secret.chars().count() >= 4 && !secret.chars().all(|ch| ch == '*') {
                 out = out.replace(secret.as_str(), scrub::REDACTED);
             }
         }
@@ -133,11 +133,31 @@ impl SabClient {
             .unwrap_or_default())
     }
 
-    pub async fn set_server_connections(&self, server: &str, connections: u32) -> Result<()> {
+    /// Set `server`'s connections. SABnzbd's `set_config` on `servers` is
+    /// update-or-create, so an unknown name would add a server: it must exist.
+    pub(crate) async fn set_server_connections(
+        &self,
+        server: &str,
+        connections: u32,
+    ) -> Result<()> {
+        let servers = self.get_config("servers").await?;
+        if !server_names(&servers).iter().any(|n| n == server) {
+            bail!("sabnzbd has no server named `{server}`");
+        }
         let n = connections.to_string();
         self.set_config("servers", Some(server), &[("connections", &n)])
             .await
     }
+}
+
+/// Names of the servers in a `get_config("servers")` reply.
+pub(crate) fn server_names(servers: &Value) -> Vec<String> {
+    servers
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s.get("name")?.as_str().map(str::to_string))
+        .collect()
 }
 
 fn collect_secrets(v: &Value, out: &mut Vec<String>) {
@@ -162,10 +182,10 @@ mod tests {
     use super::*;
     use plugin_toolkit::serde_json::json;
     use wiremock::matchers::{body_string_contains, method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
     #[tokio::test]
-    async fn api_sends_key_and_params_and_surfaces_errors() {
+    async fn get_config_sends_key_and_section() {
         let s = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api"))
@@ -178,6 +198,14 @@ mod tests {
             )
             .mount(&s)
             .await;
+        let c = SabClient::new(&format!("{}/", s.uri()), "k y");
+        let misc = c.get_config("misc").await.unwrap();
+        assert_eq!(misc["download_dir"], "/incomplete");
+    }
+
+    #[tokio::test]
+    async fn warnings_read_old_and_new_shapes() {
+        let s = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api"))
             .and(body_string_contains("mode=warnings"))
@@ -186,29 +214,82 @@ mod tests {
             ))
             .mount(&s)
             .await;
+        let c = SabClient::new(&s.uri(), "k");
+        assert_eq!(c.warnings().await.unwrap(), vec!["old style", "new style"]);
+    }
+
+    #[tokio::test]
+    async fn status_false_replies_are_errors() {
+        let s = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api"))
-            .and(body_string_contains("mode=set_config"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(json!({"status": false, "error": "API Key Incorrect"})),
             )
             .mount(&s)
             .await;
-        let c = SabClient::new(&format!("{}/", s.uri()), "k y");
-        let misc = c.get_config("misc").await.unwrap();
-        assert_eq!(misc["download_dir"], "/incomplete");
-        assert_eq!(c.warnings().await.unwrap(), vec!["old style", "new style"]);
-        let err = c.set_server_connections("eweka", 20).await.unwrap_err();
-        assert!(err.to_string().contains("API Key Incorrect"));
+        let err = SabClient::new(&s.uri(), "k")
+            .set_config("misc", None, &[("x", "1")])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("API Key Incorrect"), "{err}");
     }
 
     #[tokio::test]
-    async fn errors_never_carry_the_api_key() {
-        // Nothing listens on port 9 here: a refused connection.
-        let c = SabClient::new("http://127.0.0.1:9", "s3cr3t-key");
-        let err = c.warnings().await.unwrap_err().to_string();
+    async fn set_server_connections_refuses_an_unknown_server() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api"))
+            .and(body_string_contains("mode=get_config"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"config": {"servers": [{"name": "eweka"}]}})),
+            )
+            .mount(&s)
+            .await;
+        let err = SabClient::new(&s.uri(), "k")
+            .set_server_connections("ghost", 20)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no server named `ghost`"), "{err}");
+        let req = s.received_requests().await.unwrap();
+        assert!(req
+            .iter()
+            .all(|r| !String::from_utf8_lossy(&r.body).contains("mode=set_config")));
+    }
+
+    /// Replies 500 with the request body, as a misbehaving proxy might.
+    struct EchoBody;
+
+    impl Respond for EchoBody {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            ResponseTemplate::new(500).set_body_bytes(req.body.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_echoed_request_never_carries_the_api_key() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api"))
+            .respond_with(EchoBody)
+            .mount(&s)
+            .await;
+        let err = SabClient::new(&s.uri(), "s3cr3t-key")
+            .warnings()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("http 500") && err.contains("mode=warnings"),
+            "{err}"
+        );
         assert!(!err.contains("s3cr3t-key"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_error_message_never_carries_the_api_key() {
         let s = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api"))
@@ -227,6 +308,16 @@ mod tests {
             !err.contains("s3cr3t-key") && err.contains("<redacted>"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn scrub_skips_short_and_masked_values() {
+        let c = SabClient::new("http://x", "k");
+        c.remember_secrets(&json!({"servers": [
+            {"password": "ab"}, {"password": "****"}, {"password": "hunter2"}
+        ]}));
+        assert_eq!(c.scrub("k ab **** ok"), "k ab **** ok");
+        assert_eq!(c.scrub("pw hunter2"), "pw <redacted>");
     }
 
     #[tokio::test]

@@ -2,7 +2,7 @@
 //!
 //! Implements `ServiceBackend` so the generic `service.*` tools
 //! (deploy/backup/restore/configure/status/connect/sync) drive sabnzbd, plus
-//! read-only diagnostic tools in [`tools`]. The only orca dep is
+//! the `sabnzbd.*` tools in [`tools`]. The only orca dep is
 //! `plugin-toolkit`. Modeled on the nfs StorageBackend. See orca/docs/PLUGIN-PROGRAM.md.
 #![allow(clippy::disallowed_types)]
 

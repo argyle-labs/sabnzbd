@@ -17,15 +17,34 @@ pub struct ClassifiedWarning {
     pub actionable: bool,
 }
 
+/// Path components with `.` dropped and `..` resolved lexically.
+fn components(path: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    for c in path.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn component_prefix(path: &str, prefix: &str) -> bool {
-    let comps = |p: &str| -> Vec<String> {
-        p.split('/')
-            .filter(|c| !c.is_empty() && *c != ".")
-            .map(str::to_string)
-            .collect()
-    };
-    let (p, pre) = (comps(path), comps(prefix));
+    let (p, pre) = (components(path), components(prefix));
     !pre.is_empty() && p.starts_with(&pre)
+}
+
+/// Absolute paths in `text`, stripped of surrounding quotes and trailing punctuation.
+fn paths(text: &str) -> impl Iterator<Item = &str> {
+    text.split_whitespace()
+        .map(|t| {
+            t.trim_start_matches(['"', '\'', '(', '['])
+                .trim_end_matches(['"', '\'', ')', ']', '.', ',', ';', ':', '!', '?'])
+        })
+        .filter(|t| t.starts_with('/'))
 }
 
 /// `special_chars_ok` lists paths verified to accept special-character names
@@ -33,18 +52,14 @@ fn component_prefix(path: &str, prefix: &str) -> bool {
 pub fn classify(text: &str, special_chars_ok: &[String]) -> ClassifiedWarning {
     let lower = text.to_lowercase();
     let (class, actionable) = if lower.contains(SPECIAL_CHARS) {
-        let verified = text
-            .split_whitespace()
-            .filter(|t| t.starts_with('/'))
-            .any(|p| special_chars_ok.iter().any(|ok| component_prefix(p, ok)));
+        let verified =
+            paths(text).any(|p| special_chars_ok.iter().any(|ok| component_prefix(p, ok)));
         if verified {
             ("special-chars-false-positive", false)
         } else {
             ("special-chars", true)
         }
-    } else if lower.contains("too many connections")
-        || (lower.contains("502 ") && lower.contains("connection"))
-    {
+    } else if crate::servers::is_limit_warning(text) {
         ("connection-limit", true)
     } else {
         ("other", true)
@@ -71,6 +86,32 @@ mod tests {
         );
         let c = classify(W, &["/downloads2".into()]);
         assert_eq!((c.class.as_str(), c.actionable), ("special-chars", true));
+    }
+
+    #[test]
+    fn paths_are_unquoted_trimmed_and_normalized() {
+        let ok = ["/downloads".to_string()];
+        let class = |t: &str| classify(t, &ok).class;
+        assert_eq!(
+            class(
+                "Folder '/downloads/incomplete' is not writable with special character filenames"
+            ),
+            "special-chars-false-positive"
+        );
+        assert_eq!(
+            class(
+                "Folder \"/downloads/incomplete\": not writable with special character filenames"
+            ),
+            "special-chars-false-positive"
+        );
+        assert_eq!(
+            class("/downloads/../etc is not writable with special character filenames"),
+            "special-chars"
+        );
+        assert_eq!(
+            class("/downloads/./a/../b. is not writable with special character filenames"),
+            "special-chars-false-positive"
+        );
     }
 
     #[test]

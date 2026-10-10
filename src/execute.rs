@@ -1,13 +1,8 @@
-//! Admin check for this plugin's mutating tools.
+//! Admin check for this plugin's mutating tools, run on every call path.
 //!
-//! Mutating tools set `execute_gated = false` and own their `execute` flag, so
-//! the dry run can report the exact drift. Opting out of the central gate also
-//! opts out of the role check orca runs inside it, so [`require_admin`]
-//! replaces it, on the dry run too.
-//!
-//! Interim: once orca carries dry run centrally (`dryRun`, read as
-//! `ctx.dry_run()`, execute by default), tools drop their `execute` arg and
-//! keep this check.
+//! With `execute_gated = false` orca's dispatch skips its execute-time role
+//! check, so this check runs on the dry run and the execute alike. The dry run
+//! becomes orca's central `dryRun` flag once it lands; this check stays.
 
 use plugin_toolkit::contract::CallerIdentity;
 use plugin_toolkit::prelude::*;

@@ -1,11 +1,5 @@
-//! sabnzbd tool surface.
-//!
-//! Endpoint registry: `sabnzbd.{list, detail, create, update, delete}`.
-//!
-//!   - `sabnzbd.incomplete.status`  whether `download_dir` (incomplete) is on local disk
-//!   - `sabnzbd.servers.status`     connections per news server against its account limit
-//!   - `sabnzbd.servers.sync`       lower connections to the declared limit (admin; dry run unless `execute`)
-//!   - `sabnzbd.warnings.status`    current warnings, classified, with known false positives marked
+//! sabnzbd tools: the endpoint registry plus `incomplete`, `servers` and
+//! `warnings` diagnostics, and `servers.sync`.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -13,7 +7,7 @@ use std::path::Path;
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::serde_json::Value;
 
-use crate::client::SabClient;
+use crate::client::{self, SabClient};
 use crate::execute;
 use crate::incomplete::{self, IncompleteStatus};
 use crate::servers::{self, ServerStatus};
@@ -188,6 +182,7 @@ pub struct ConnectionChange {
 }
 
 #[orca_struct]
+#[derive(Debug)]
 pub struct ServersSyncOutput {
     /// Servers lowered (or to lower, on a dry run) to their limit.
     pub changes: Vec<ConnectionChange>,
@@ -198,11 +193,9 @@ pub struct ServersSyncOutput {
 }
 
 /// Lower each server's connections to its declared limit. Servers under their
-/// limit are left alone. Verifies the write. Admin-only, dry run included.
-///
-/// The `execute` flag is interim: orca will carry dry run centrally as
-/// `dryRun` (`ctx.dry_run()`) with execute as the default, and this tool's
-/// one dry-run check swaps to it.
+/// limit are left alone. Admin-only, dry run included. After writing, reads
+/// the servers back and fails unless each took its limit and no server was
+/// added. The read-back checks SABnzbd's live config, not that it reached disk.
 #[orca_tool(
     domain = "sabnzbd",
     verb = "servers.sync",
@@ -219,7 +212,8 @@ async fn sabnzbd_servers_sync(args: ServersSyncArgs, ctx: &ToolCtx) -> Result<Se
 
 /// Changes that bring each over-limit server down to its limit, plus refusals:
 /// a limit naming no configured server (a typo would otherwise apply nothing
-/// silently).
+/// silently), a key given twice, or a server limited by both name and host
+/// with different values.
 fn plan_servers(
     statuses: &[ServerStatus],
     limits: &[(String, u32)],
@@ -236,11 +230,39 @@ fn plan_servers(
             })
         })
         .collect();
-    let refusals = limits
+    let lookup = |k: &str| -> Vec<u32> {
+        limits
+            .iter()
+            .filter(|(key, _)| key == k)
+            .map(|(_, n)| *n)
+            .collect()
+    };
+    let mut refusals: Vec<String> = limits
         .iter()
         .filter(|(k, _)| !statuses.iter().any(|s| &s.name == k || &s.host == k))
         .map(|(k, _)| format!("limit `{k}` matches no configured server name or host"))
         .collect();
+    let mut keys: Vec<&str> = limits.iter().map(|(k, _)| k.as_str()).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    for k in keys {
+        let mut ns = lookup(k);
+        ns.dedup();
+        if ns.len() > 1 {
+            refusals.push(format!("limit `{k}` is given more than once: {ns:?}"));
+        }
+    }
+    for s in statuses {
+        let (by_name, by_host) = (lookup(&s.name), lookup(&s.host));
+        if let (Some(a), Some(b)) = (by_name.first(), by_host.first()) {
+            if a != b && s.name != s.host {
+                refusals.push(format!(
+                    "server `{}` is limited to {a} by name and {b} by host `{}`",
+                    s.name, s.host
+                ));
+            }
+        }
+    }
     (changes, refusals)
 }
 
@@ -249,8 +271,10 @@ async fn servers_sync(
     limits: &[(String, u32)],
     dry_run: bool,
 ) -> Result<ServersSyncOutput> {
-    let (changes, refusals) = plan_servers(&server_statuses(c, limits).await?, limits);
-    if dry_run || changes.is_empty() {
+    let before = c.get_config("servers").await?;
+    let limit_map: BTreeMap<String, u32> = limits.iter().cloned().collect();
+    let (changes, refusals) = plan_servers(&servers::assess(&before, &limit_map, &[]), limits);
+    if dry_run {
         return Ok(ServersSyncOutput {
             changes,
             refusals,
@@ -261,29 +285,63 @@ async fn servers_sync(
     if !refusals.is_empty() {
         bail!("sabnzbd.servers.sync refused: {}", refusals.join("; "));
     }
+    if changes.is_empty() {
+        return Ok(ServersSyncOutput {
+            changes,
+            refusals,
+            changed: false,
+            dry_run,
+        });
+    }
     // Keep going past a failed server so one bad entry does not leave the
     // rest unapplied; the error then says exactly which ones took.
-    let mut failed = Vec::new();
+    let mut written = Vec::new();
+    let mut problems = Vec::new();
     for ch in &changes {
-        if let Err(e) = c.set_server_connections(&ch.name, ch.to).await {
-            failed.push(format!("{}: {e}", ch.name));
+        match c.set_server_connections(&ch.name, ch.to).await {
+            Ok(()) => written.push(ch.name.clone()),
+            Err(e) => problems.push(format!("{}: {e}", ch.name)),
         }
     }
-    let still: Vec<String> = server_statuses(c, limits)
-        .await?
-        .into_iter()
-        .filter(|s| s.over_limit)
-        .map(|s| s.name)
-        .collect();
-    if !failed.is_empty() || !still.is_empty() {
-        let applied: Vec<&str> = changes
-            .iter()
-            .map(|ch| ch.name.as_str())
-            .filter(|n| !still.iter().any(|x| x == n))
-            .collect();
+    match c.get_config("servers").await {
+        Err(e) => problems.push(format!("read-back failed: {e}")),
+        Ok(after) => {
+            let known = client::server_names(&before);
+            let added: Vec<String> = client::server_names(&after)
+                .into_iter()
+                .filter(|n| !known.contains(n))
+                .collect();
+            if !added.is_empty() {
+                problems.push(format!(
+                    "servers appeared that were not there before: {added:?}"
+                ));
+            }
+            for ch in changes.iter().filter(|ch| written.contains(&ch.name)) {
+                let now = after
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|s| s.get("name").and_then(Value::as_str) == Some(ch.name.as_str()));
+                match now
+                    .and_then(|s| s.get("connections"))
+                    .and_then(servers::as_u32)
+                {
+                    Some(n) if n == ch.to => {}
+                    Some(n) => problems.push(format!(
+                        "{}: reads back {n} connections, wrote {}",
+                        ch.name, ch.to
+                    )),
+                    None => {
+                        problems.push(format!("{}: missing or unreadable on read-back", ch.name))
+                    }
+                }
+            }
+        }
+    }
+    if !problems.is_empty() {
         bail!(
-            "sabnzbd did not take the connection limit for {still:?} (applied: {applied:?}; errors: {})",
-            if failed.is_empty() { "none".to_string() } else { failed.join("; ") }
+            "sabnzbd.servers.sync incomplete (written: {written:?}): {}",
+            problems.join("; ")
         );
     }
     Ok(ServersSyncOutput {
@@ -320,10 +378,19 @@ async fn sabnzbd_warnings_status(
     args: WarningsStatusArgs,
     _ctx: &ToolCtx,
 ) -> Result<WarningsStatusOutput> {
-    let warns = connect(&args.name).await?.warnings().await?;
-    let warnings: Vec<ClassifiedWarning> = warns
+    let c = connect(&args.name).await?;
+    warnings_status(&c, &args.special_chars_ok).await
+}
+
+async fn warnings_status(
+    c: &SabClient,
+    special_chars_ok: &[String],
+) -> Result<WarningsStatusOutput> {
+    let warnings: Vec<ClassifiedWarning> = c
+        .warnings()
+        .await?
         .iter()
-        .map(|w| warnings::classify(w, &args.special_chars_ok))
+        .map(|w| warnings::classify(&c.scrub(w), special_chars_ok))
         .collect();
     Ok(WarningsStatusOutput {
         actionable: warnings.iter().filter(|w| w.actionable).count(),
@@ -335,7 +402,11 @@ async fn sabnzbd_warnings_status(
 mod tests {
     use super::*;
     use plugin_toolkit::contract::config::{Config, Model, Ports};
-    use std::sync::Arc;
+    use plugin_toolkit::contract::CallerIdentity;
+    use plugin_toolkit::serde_json::json;
+    use std::sync::{Arc, Mutex};
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
     fn ctx(home: &Path) -> ToolCtx {
         ToolCtx::new(Arc::new(Config {
@@ -353,43 +424,86 @@ mod tests {
         }))
     }
 
-    async fn sab(servers: Value, warnings: Value) -> (wiremock::MockServer, SabClient) {
-        use wiremock::matchers::{body_string_contains, method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+    /// A SABnzbd whose `set_config` writes land in `servers`, served back by
+    /// `get_config`.
+    #[derive(Clone, Default)]
+    struct Sab {
+        servers: Arc<Mutex<Value>>,
+        /// Ignore writes instead of applying them.
+        ignore_writes: bool,
+        /// Add a server on every write, as an upsert of a wrong name would.
+        add_on_write: bool,
+        /// Fail `get_config` once a write has landed.
+        fail_after_write: bool,
+        wrote: Arc<Mutex<bool>>,
+    }
+
+    fn form(req: &Request, key: &str) -> Option<String> {
+        // Values in these tests need no percent-decoding.
+        String::from_utf8_lossy(&req.body)
+            .split('&')
+            .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('=').map(str::to_string))
+    }
+
+    impl Respond for Sab {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            let ok = |v: Value| ResponseTemplate::new(200).set_body_json(v);
+            match form(req, "mode").as_deref() {
+                Some("get_config") if self.fail_after_write && *self.wrote.lock().unwrap() => {
+                    ok(json!({"status": false, "error": "boom"}))
+                }
+                Some("get_config") => {
+                    ok(json!({"config": {"servers": self.servers.lock().unwrap().clone()}}))
+                }
+                Some("warnings") => ok(json!({"warnings": []})),
+                Some("set_config") => {
+                    *self.wrote.lock().unwrap() = true;
+                    let mut servers = self.servers.lock().unwrap();
+                    if !self.ignore_writes {
+                        let name = form(req, "keyword").unwrap();
+                        let n: u32 = form(req, "connections").unwrap().parse().unwrap();
+                        for s in servers.as_array_mut().unwrap() {
+                            if s["name"] == name.as_str() {
+                                s["connections"] = json!(n);
+                            }
+                        }
+                    }
+                    if self.add_on_write {
+                        servers
+                            .as_array_mut()
+                            .unwrap()
+                            .push(json!({"name": "ghost", "host": "", "connections": 0}));
+                    }
+                    ok(json!({"status": true}))
+                }
+                _ => ResponseTemplate::new(404),
+            }
+        }
+    }
+
+    async fn serve(sab: Sab) -> (MockServer, SabClient) {
         let s = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api"))
-            .and(body_string_contains("mode=get_config"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(
-                    plugin_toolkit::serde_json::json!({"config": {"servers": servers}}),
-                ),
-            )
-            .mount(&s)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/api"))
-            .and(body_string_contains("mode=warnings"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(plugin_toolkit::serde_json::json!({"warnings": warnings})),
-            )
-            .mount(&s)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/api"))
-            .and(body_string_contains("mode=set_config"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(plugin_toolkit::serde_json::json!({"status": true})),
-            )
+            .respond_with(sab)
             .mount(&s)
             .await;
         let c = SabClient::new(&s.uri(), "k");
         (s, c)
     }
 
-    async fn set_calls(s: &wiremock::MockServer) -> usize {
+    fn sab_with(servers: Value) -> Sab {
+        Sab {
+            servers: Arc::new(Mutex::new(servers)),
+            ..Sab::default()
+        }
+    }
+
+    fn eweka() -> Value {
+        json!([{"name": "eweka", "host": "news.eweka.nl", "connections": 30}])
+    }
+
+    async fn set_calls(s: &MockServer) -> usize {
         s.received_requests()
             .await
             .unwrap()
@@ -400,11 +514,7 @@ mod tests {
 
     #[tokio::test]
     async fn servers_sync_dry_run_plans_without_writing() {
-        let (s, c) = sab(
-            plugin_toolkit::serde_json::json!([{"name": "eweka", "host": "news.eweka.nl", "connections": 30}]),
-            plugin_toolkit::serde_json::json!([]),
-        )
-        .await;
+        let (s, c) = serve(sab_with(eweka())).await;
         let r = servers_sync(&c, &[("eweka".into(), 20), ("typo".into(), 5)], true)
             .await
             .unwrap();
@@ -423,71 +533,166 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn servers_sync_execute_fails_when_the_limit_does_not_take() {
-        let (s, c) = sab(
-            plugin_toolkit::serde_json::json!([{"name": "eweka", "host": "news.eweka.nl", "connections": 30}]),
-            plugin_toolkit::serde_json::json!([]),
+    async fn servers_sync_plans_from_a_host_keyed_limit() {
+        let (_s, c) = serve(sab_with(eweka())).await;
+        let r = servers_sync(&c, &[("news.eweka.nl".into(), 20)], true)
+            .await
+            .unwrap();
+        assert_eq!((r.changes[0].name.as_str(), r.changes[0].to), ("eweka", 20));
+        assert!(r.refusals.is_empty(), "{:?}", r.refusals);
+    }
+
+    #[tokio::test]
+    async fn servers_sync_refuses_conflicting_name_and_host_limits() {
+        let (_s, c) = serve(sab_with(eweka())).await;
+        let r = servers_sync(
+            &c,
+            &[("eweka".into(), 20), ("news.eweka.nl".into(), 10)],
+            true,
         )
+        .await
+        .unwrap();
+        assert_eq!(r.refusals.len(), 1, "{:?}", r.refusals);
+        assert!(
+            r.refusals[0].contains("by name and 10 by host"),
+            "{:?}",
+            r.refusals
+        );
+    }
+
+    #[tokio::test]
+    async fn servers_sync_execute_applies_and_reads_back() {
+        let sab = sab_with(eweka());
+        let (s, c) = serve(sab.clone()).await;
+        let r = servers_sync(&c, &[("eweka".into(), 20)], false)
+            .await
+            .unwrap();
+        assert!(r.changed && !r.dry_run);
+        assert_eq!(set_calls(&s).await, 1);
+        assert_eq!(sab.servers.lock().unwrap()[0]["connections"], 20);
+    }
+
+    #[tokio::test]
+    async fn servers_sync_execute_fails_when_the_limit_does_not_take() {
+        let (s, c) = serve(Sab {
+            ignore_writes: true,
+            ..sab_with(eweka())
+        })
         .await;
         let err = servers_sync(&c, &[("eweka".into(), 20)], false)
             .await
-            .err()
-            .unwrap();
-        assert!(err.to_string().contains("did not take"), "{err}");
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("eweka: reads back 30 connections, wrote 20"),
+            "{err}"
+        );
         assert_eq!(set_calls(&s).await, 1);
     }
 
     #[tokio::test]
-    async fn servers_sync_reports_a_partial_apply() {
-        use wiremock::matchers::{body_string_contains, method, path};
-        use wiremock::{Mock, ResponseTemplate};
-        let (s, c) = sab(
-            plugin_toolkit::serde_json::json!([
-                {"name": "a", "host": "a.example", "connections": 30},
-                {"name": "b", "host": "b.example", "connections": 30}
-            ]),
-            plugin_toolkit::serde_json::json!([]),
-        )
+    async fn servers_sync_execute_reports_a_server_that_appeared() {
+        let (_s, c) = serve(Sab {
+            add_on_write: true,
+            ..sab_with(eweka())
+        })
         .await;
+        let err = servers_sync(&c, &[("eweka".into(), 20)], false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("appeared") && err.contains("ghost"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn servers_sync_read_back_failure_still_reports_the_writes() {
+        let servers = json!([
+            {"name": "a", "host": "a.example", "connections": 30},
+            {"name": "b", "host": "b.example", "connections": 30}
+        ]);
+        let (s, c) = serve(Sab {
+            fail_after_write: true,
+            ..sab_with(servers)
+        })
+        .await;
+        let err = servers_sync(&c, &[("a".into(), 20), ("b".into(), 20)], false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(set_calls(&s).await, 1, "b's existence check failed");
+        assert!(err.contains(r#"written: ["a"]"#), "{err}");
+        assert!(err.contains("b: sabnzbd get_config: boom"), "{err}");
+        assert!(err.contains("read-back failed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn servers_sync_reports_a_partial_apply() {
+        let servers = json!([
+            {"name": "a", "host": "a.example", "connections": 30},
+            {"name": "b", "host": "b.example", "connections": 30}
+        ]);
+        let (s, c) = serve(sab_with(servers)).await;
         Mock::given(method("POST"))
             .and(path("/api"))
             .and(body_string_contains("mode=set_config"))
             .and(body_string_contains("keyword=a"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                plugin_toolkit::serde_json::json!({"status": false, "error": "nope"}),
-            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"status": false, "error": "nope"})),
+            )
             .with_priority(1)
             .mount(&s)
             .await;
         let err = servers_sync(&c, &[("a".into(), 20), ("b".into(), 20)], false)
             .await
-            .err()
-            .unwrap()
+            .unwrap_err()
             .to_string();
         assert_eq!(set_calls(&s).await, 2, "kept going after a failed server");
         assert!(err.contains("a: sabnzbd set_config: nope"), "{err}");
+        assert!(err.contains(r#"written: ["b"]"#), "{err}");
     }
 
     #[tokio::test]
     async fn servers_sync_execute_is_refused_when_a_limit_matches_nothing() {
-        let (s, c) = sab(
-            plugin_toolkit::serde_json::json!([{"name": "eweka", "host": "news.eweka.nl", "connections": 30}]),
-            plugin_toolkit::serde_json::json!([]),
-        )
-        .await;
+        let (s, c) = serve(sab_with(eweka())).await;
         let err = servers_sync(&c, &[("eweka".into(), 20), ("typo".into(), 5)], false)
             .await
-            .err()
-            .unwrap();
+            .unwrap_err();
         assert!(err.to_string().contains("refused"), "{err}");
         assert_eq!(set_calls(&s).await, 0);
+    }
+
+    #[tokio::test]
+    async fn servers_sync_execute_is_refused_even_with_nothing_to_change() {
+        let (s, c) = serve(sab_with(eweka())).await;
+        let err = servers_sync(&c, &[("eweka".into(), 40), ("typo".into(), 5)], false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("refused"), "{err}");
+        assert_eq!(set_calls(&s).await, 0);
+    }
+
+    #[tokio::test]
+    async fn warnings_status_scrubs_each_warning() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"warnings": ["login with s3cr3t-key failed"]})),
+            )
+            .mount(&s)
+            .await;
+        let c = SabClient::new(&s.uri(), "s3cr3t-key");
+        let r = warnings_status(&c, &[]).await.unwrap();
+        assert_eq!(r.warnings[0].text, "login with <redacted> failed");
+        assert_eq!(r.actionable, 1);
     }
 
     #[tokio::test]
     async fn servers_sync_refuses_non_admins_on_the_dry_run() {
         let dir = tempfile::tempdir().unwrap();
         let mut ctx = ctx(dir.path());
-        ctx.set_caller(Some(plugin_toolkit::contract::CallerIdentity {
+        ctx.set_caller(Some(CallerIdentity {
             user_id: "u".into(),
             username: "op".into(),
             role: "user".into(),
@@ -529,9 +734,8 @@ mod tests {
 
     #[test]
     fn misc_dirs_come_from_the_api_section() {
-        let d = misc_dirs(
-            &plugin_toolkit::serde_json::json!({"download_dir": "Downloads/incomplete", "complete_dir": "/data"}),
-        );
+        let d =
+            misc_dirs(&json!({"download_dir": "Downloads/incomplete", "complete_dir": "/data"}));
         assert_eq!(d.download_dir, "Downloads/incomplete");
     }
 

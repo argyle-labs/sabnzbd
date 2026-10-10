@@ -21,15 +21,28 @@ pub struct ServerStatus {
     pub limit_warnings: usize,
 }
 
-fn as_u32(v: &Value) -> Option<u32> {
+pub(crate) fn as_u32(v: &Value) -> Option<u32> {
     v.as_u64()
-        .map(|n| n as u32)
+        .and_then(|n| u32::try_from(n).ok())
         .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
 }
 
-fn is_limit_warning(text: &str) -> bool {
+/// Whether a warning reports the provider's account connection limit.
+pub(crate) fn is_limit_warning(text: &str) -> bool {
     let t = text.to_lowercase();
-    t.contains("too many connections") || (t.contains("502 ") && t.contains("connection"))
+    t.contains("too many connections") || t.contains("connection limit")
+}
+
+/// Whether `text` names `host` as a whole token, optionally with `:port`.
+fn names_host(text: &str, host: &str) -> bool {
+    !host.is_empty()
+        && text
+            .split(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | ':')))
+            .map(|t| t.trim_end_matches(['.', ':']))
+            .any(|t| {
+                let (h, port) = t.split_once(':').unwrap_or((t, ""));
+                h.eq_ignore_ascii_case(host) && port.chars().all(|ch| ch.is_ascii_digit())
+            })
 }
 
 /// `limits` is keyed by server name or host.
@@ -53,7 +66,7 @@ pub fn assess(
             let limit = limits.get(&name).or_else(|| limits.get(&host)).copied();
             let limit_warnings = warnings
                 .iter()
-                .filter(|w| is_limit_warning(w) && !host.is_empty() && w.contains(&host))
+                .filter(|w| is_limit_warning(w) && names_host(w, &host))
                 .count();
             Some(ServerStatus {
                 over_limit: limit.is_some_and(|l| connections > l),
@@ -95,10 +108,28 @@ mod tests {
     }
 
     #[test]
-    fn only_connection_502s_count_as_limit_warnings() {
+    fn only_connection_limit_texts_count_as_limit_warnings() {
         assert!(is_limit_warning("Too many connections to server x"));
         assert!(is_limit_warning("server x [502 Connection limit reached]"));
         assert!(!is_limit_warning("Article 5021 missing from server x"));
         assert!(!is_limit_warning("server x [502 Bad Gateway]"));
+        assert!(!is_limit_warning("server x [502 connection reset]"));
+    }
+
+    #[test]
+    fn hosts_match_as_whole_tokens() {
+        let h = "news.eweka.nl";
+        assert!(names_host("Too many connections to NEWS.EWEKA.NL:563.", h));
+        assert!(names_host("server news.eweka.nl [502]", h));
+        assert!(!names_host("server xnews.eweka.nl [502]", h));
+        assert!(!names_host("server news.eweka.nl.evil [502]", h));
+        assert!(!names_host("server news.eweka.nl:abc", h));
+        assert!(!names_host("anything", ""));
+    }
+
+    #[test]
+    fn oversized_connection_counts_do_not_wrap() {
+        assert_eq!(as_u32(&json!(4_294_967_296u64)), None);
+        assert_eq!(as_u32(&json!(" 20 ")), Some(20));
     }
 }
