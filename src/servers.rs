@@ -29,7 +29,7 @@ fn as_u32(v: &Value) -> Option<u32> {
 
 fn is_limit_warning(text: &str) -> bool {
     let t = text.to_lowercase();
-    t.contains("too many connections") || t.contains("502")
+    t.contains("too many connections") || (t.contains("502 ") && t.contains("connection"))
 }
 
 /// `limits` is keyed by server name or host.
@@ -92,5 +92,13 @@ mod tests {
             (r[1].connections, r[1].over_limit, r[1].limit_warnings),
             (60, false, 0)
         );
+    }
+
+    #[test]
+    fn only_connection_502s_count_as_limit_warnings() {
+        assert!(is_limit_warning("Too many connections to server x"));
+        assert!(is_limit_warning("server x [502 Connection limit reached]"));
+        assert!(!is_limit_warning("Article 5021 missing from server x"));
+        assert!(!is_limit_warning("server x [502 Bad Gateway]"));
     }
 }

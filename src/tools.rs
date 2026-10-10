@@ -212,9 +212,16 @@ async fn servers_sync(
         .collect();
     let changed = execute && !lowered.is_empty();
     if changed {
+        // Keep going past a failed server so one bad entry does not leave the
+        // rest unapplied; the error then says exactly which ones took.
+        let mut failed = Vec::new();
         for s in &lowered {
-            c.set_server_connections(&s.name, s.limit.unwrap_or(s.connections))
-                .await?;
+            if let Err(e) = c
+                .set_server_connections(&s.name, s.limit.unwrap_or(s.connections))
+                .await
+            {
+                failed.push(format!("{}: {e}", s.name));
+            }
         }
         let still: Vec<String> = server_statuses(c, limits)
             .await?
@@ -222,8 +229,16 @@ async fn servers_sync(
             .filter(|s| s.over_limit)
             .map(|s| s.name)
             .collect();
-        if !still.is_empty() {
-            bail!("sabnzbd did not take the connection limit for {still:?}");
+        if !failed.is_empty() || !still.is_empty() {
+            let applied: Vec<&str> = lowered
+                .iter()
+                .map(|s| s.name.as_str())
+                .filter(|n| !still.iter().any(|x| x == n))
+                .collect();
+            bail!(
+                "sabnzbd did not take the connection limit for {still:?} (applied: {applied:?}; errors: {})",
+                if failed.is_empty() { "none".to_string() } else { failed.join("; ") }
+            );
         }
     }
     Ok(ServersSyncOutput {
@@ -365,6 +380,37 @@ mod tests {
             .unwrap();
         assert!(err.to_string().contains("did not take"), "{err}");
         assert_eq!(set_calls(&s).await, 1);
+    }
+
+    #[tokio::test]
+    async fn servers_sync_reports_a_partial_apply() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+        let (s, c) = sab(
+            plugin_toolkit::serde_json::json!([
+                {"name": "a", "host": "a.example", "connections": 30},
+                {"name": "b", "host": "b.example", "connections": 30}
+            ]),
+            plugin_toolkit::serde_json::json!([]),
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path("/api"))
+            .and(query_param("mode", "set_config"))
+            .and(query_param("keyword", "a"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                plugin_toolkit::serde_json::json!({"status": false, "error": "nope"}),
+            ))
+            .with_priority(1)
+            .mount(&s)
+            .await;
+        let err = servers_sync(&c, &[("a".into(), 20), ("b".into(), 20)], true)
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert_eq!(set_calls(&s).await, 2, "kept going after a failed server");
+        assert!(err.contains("a: sabnzbd set_config: nope"), "{err}");
     }
 
     #[tokio::test]

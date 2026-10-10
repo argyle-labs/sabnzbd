@@ -42,7 +42,9 @@ pub fn classify(text: &str, special_chars_ok: &[String]) -> ClassifiedWarning {
         } else {
             ("special-chars", true)
         }
-    } else if lower.contains("too many connections") || lower.contains("502") {
+    } else if lower.contains("too many connections")
+        || (lower.contains("502 ") && lower.contains("connection"))
+    {
         ("connection-limit", true)
     } else {
         ("other", true)
