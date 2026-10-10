@@ -6,8 +6,12 @@
 //! `plugin-toolkit`. Modeled on the nfs StorageBackend. See orca/docs/PLUGIN-PROGRAM.md.
 #![allow(clippy::disallowed_types)]
 
+pub mod client;
+pub mod execute;
 pub mod incomplete;
+pub mod servers;
 pub mod tools;
+pub mod warnings;
 
 use plugin_toolkit::service::{
     BoxFuture, Routes, Runtime, ServiceBackend, ServiceCapability, ServiceError, ServiceStatus,
