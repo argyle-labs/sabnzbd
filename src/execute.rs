@@ -1,0 +1,49 @@
+//! Admin check for this plugin's mutating tools, run on every call path.
+//!
+//! With `execute_gated = false` orca's dispatch skips its execute-time role
+//! check, so this check runs on the dry run and the execute alike. The dry run
+//! becomes orca's central `dryRun` flag once it lands; this check stays.
+
+use plugin_toolkit::contract::CallerIdentity;
+use plugin_toolkit::prelude::*;
+
+pub fn require_admin(tool: &str, ctx: &ToolCtx) -> Result<()> {
+    check_admin(tool, ctx.caller().as_ref())
+}
+
+fn check_admin(subject: &str, caller: Option<&CallerIdentity>) -> Result<()> {
+    match caller {
+        Some(c) if c.role == "admin" => Ok(()),
+        Some(c) => bail!(
+            "{subject} requires role 'admin'; caller '{}' has '{}'",
+            c.username,
+            c.role
+        ),
+        None => bail!(
+            "{subject} refused: the call carries no caller identity, so admin cannot be verified"
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn caller(role: &str) -> CallerIdentity {
+        CallerIdentity {
+            user_id: "u".into(),
+            username: "op".into(),
+            role: role.into(),
+            can_mutate: true,
+        }
+    }
+
+    #[test]
+    fn needs_an_admin_caller() {
+        assert!(check_admin("t", Some(&caller("admin"))).is_ok());
+        let err = check_admin("t", Some(&caller("user"))).unwrap_err();
+        assert!(err.to_string().contains("requires role 'admin'"), "{err}");
+        let err = check_admin("t", None).unwrap_err();
+        assert!(err.to_string().contains("no caller identity"), "{err}");
+    }
+}
