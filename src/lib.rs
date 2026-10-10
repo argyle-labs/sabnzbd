@@ -1,10 +1,13 @@
 //! sabnzbd service backend — SABnzbd usenet client.
 //!
 //! Implements `ServiceBackend` so the generic `service.*` tools
-//! (deploy/backup/restore/configure/status/connect/sync) drive sabnzbd. No
-//! `#[orca_tool]`s — the only orca dep is `plugin-toolkit`. Modeled on the
-//! nfs StorageBackend. See orca/docs/PLUGIN-PROGRAM.md.
+//! (deploy/backup/restore/configure/status/connect/sync) drive sabnzbd, plus
+//! read-only diagnostic tools in [`tools`]. The only orca dep is
+//! `plugin-toolkit`. Modeled on the nfs StorageBackend. See orca/docs/PLUGIN-PROGRAM.md.
 #![allow(clippy::disallowed_types)]
+
+pub mod incomplete;
+pub mod tools;
 
 use plugin_toolkit::service::{
     BoxFuture, Routes, Runtime, ServiceBackend, ServiceCapability, ServiceError, ServiceStatus,
