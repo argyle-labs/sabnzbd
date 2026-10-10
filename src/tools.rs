@@ -12,16 +12,7 @@ use crate::incomplete::{self, IncompleteStatus};
 pub struct IncompleteStatusArgs {
     /// Path to `sabnzbd.ini` on this host. Relative dirs resolve against its directory.
     #[arg(long)]
-    #[serde(default)]
-    pub ini_path: Option<String>,
-    /// `sabnzbd.ini` contents, instead of `ini_path`.
-    #[arg(long)]
-    #[serde(default)]
-    pub ini: Option<String>,
-    /// Directory relative dirs resolve against when `ini` is given (default `/config`).
-    #[arg(long)]
-    #[serde(default)]
-    pub base: Option<String>,
+    pub ini_path: String,
     /// Container path of a network-backed mount (repeatable), e.g. `/downloads`.
     #[arg(long = "network-prefix")]
     #[serde(default)]
@@ -29,100 +20,46 @@ pub struct IncompleteStatusArgs {
 }
 
 /// Report whether SABnzbd's incomplete `download_dir` is local. Flags one under
-/// a `network_prefixes` mount or inside `complete_dir`. Read-only.
-#[orca_tool(domain = "sabnzbd", verb = "incomplete.status", role = "any")]
+/// a `network_prefixes` mount or inside `complete_dir`. Reads a file on this
+/// host, so it is admin-only. Read-only.
+#[orca_tool(domain = "sabnzbd", verb = "incomplete.status", role = "admin")]
 async fn sabnzbd_incomplete_status(
     args: IncompleteStatusArgs,
     _ctx: &ToolCtx,
 ) -> Result<IncompleteStatus> {
-    let (ini, base) = match (args.ini, args.ini_path) {
-        (Some(_), Some(_)) => bail!("pass either ini or ini_path, not both"),
-        (Some(ini), None) => (
-            ini,
-            args.base
-                .unwrap_or_else(|| incomplete::DEFAULT_BASE.to_string()),
-        ),
-        (None, Some(path)) => {
-            let ini = std::fs::read_to_string(&path).with_context(|| format!("read {path}"))?;
-            let dir = Path::new(&path)
-                .parent()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            (ini, args.base.unwrap_or(dir))
-        }
-        (None, None) => bail!("ini or ini_path is required"),
-    };
+    incomplete_from_file(&args.ini_path, &args.network_prefixes)
+}
+
+fn incomplete_from_file(ini_path: &str, network_prefixes: &[String]) -> Result<IncompleteStatus> {
+    let ini = std::fs::read_to_string(ini_path).with_context(|| format!("read {ini_path}"))?;
+    let base = Path::new(ini_path)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
     Ok(incomplete::assess(
         &incomplete::parse_dirs(&ini),
         &base,
-        &args.network_prefixes,
+        network_prefixes,
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use plugin_toolkit::contract::config::{Config, Model, Ports};
-    use std::sync::Arc;
 
-    fn ctx(home: &Path) -> ToolCtx {
-        ToolCtx::new(Arc::new(Config {
-            anthropic_api_key: None,
-            lmstudio_url: String::new(),
-            ollama_url: String::new(),
-            default_model: Model::LMStudio {
-                id: String::new(),
-                url: String::new(),
-            },
-            app_dir: home.to_path_buf(),
-            memory_root: home.to_path_buf(),
-            db_path: home.join("orca.db"),
-            ports: Ports::default(),
-        }))
-    }
-
-    #[tokio::test]
-    async fn reads_ini_path_and_resolves_relative_dirs_beside_it() {
+    #[test]
+    fn reads_ini_path_and_resolves_relative_dirs_beside_it() {
         let dir = tempfile::tempdir().unwrap();
         let ini = dir.path().join("sabnzbd.ini");
         std::fs::write(&ini, "[misc]\ndownload_dir = Downloads/incomplete\n").unwrap();
         let base = dir.path().to_string_lossy().into_owned();
-        let args = IncompleteStatusArgs {
-            ini_path: Some(ini.to_string_lossy().into_owned()),
-            ini: None,
-            base: None,
-            network_prefixes: vec![base.clone()],
-        };
-        let s = sabnzbd_incomplete_status(args, &ctx(dir.path()))
-            .await
-            .unwrap();
+        let s = incomplete_from_file(&ini.to_string_lossy(), std::slice::from_ref(&base)).unwrap();
         assert_eq!(s.download_dir, format!("{base}/Downloads/incomplete"));
         assert!(!s.ok);
     }
 
-    #[tokio::test]
-    async fn inline_ini_defaults_base_and_rejects_ambiguous_input() {
-        let dir = tempfile::tempdir().unwrap();
-        let args = IncompleteStatusArgs {
-            ini_path: None,
-            ini: Some("[misc]\ndownload_dir = /incomplete\n".into()),
-            base: None,
-            network_prefixes: vec!["/downloads".into()],
-        };
-        assert!(
-            sabnzbd_incomplete_status(args, &ctx(dir.path()))
-                .await
-                .unwrap()
-                .ok
-        );
-        let both = IncompleteStatusArgs {
-            ini_path: Some("/x".into()),
-            ini: Some(String::new()),
-            base: None,
-            network_prefixes: vec![],
-        };
-        assert!(sabnzbd_incomplete_status(both, &ctx(dir.path()))
-            .await
-            .is_err());
+    #[test]
+    fn missing_ini_is_an_error() {
+        assert!(incomplete_from_file("/nonexistent/sabnzbd.ini", &[]).is_err());
     }
 }

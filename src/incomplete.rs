@@ -8,6 +8,9 @@ use plugin_toolkit::prelude::*;
 /// SABnzbd's config dir in the standard container image; relative dirs in
 /// `sabnzbd.ini` resolve against the directory holding the ini.
 pub const DEFAULT_BASE: &str = "/config";
+/// SABnzbd's values when `download_dir` / `complete_dir` are unset.
+pub const DEFAULT_DOWNLOAD_DIR: &str = "Downloads/incomplete";
+pub const DEFAULT_COMPLETE_DIR: &str = "Downloads/complete";
 
 /// `[misc]` directories from `sabnzbd.ini`, as written.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -105,7 +108,7 @@ pub fn resolve(dir: &str, base: &str) -> String {
 pub struct IncompleteStatus {
     /// `download_dir`, resolved to an absolute path.
     pub download_dir: String,
-    /// `complete_dir`, resolved to an absolute path; empty when unset.
+    /// `complete_dir`, resolved to an absolute path.
     pub complete_dir: String,
     /// Whether `download_dir` is local.
     pub ok: bool,
@@ -113,18 +116,20 @@ pub struct IncompleteStatus {
 }
 
 /// Paths are container-side, so network mounts are supplied by the caller.
+/// Unset dirs take SABnzbd's defaults.
 pub fn assess(dirs: &Dirs, base: &str, network_prefixes: &[String]) -> IncompleteStatus {
-    let dl = resolve(&dirs.download_dir, base);
-    let complete = if dirs.complete_dir.is_empty() {
-        String::new()
-    } else {
-        resolve(&dirs.complete_dir, base)
+    let or_default = |v: &str, d: &'static str| {
+        if v.trim().is_empty() {
+            d.to_string()
+        } else {
+            v.to_string()
+        }
     };
-    let problem = if dirs.download_dir.is_empty() {
-        None
-    } else if let Some(net) = network_prefixes.iter().find(|n| under(&dl, n)) {
+    let dl = resolve(&or_default(&dirs.download_dir, DEFAULT_DOWNLOAD_DIR), base);
+    let complete = resolve(&or_default(&dirs.complete_dir, DEFAULT_COMPLETE_DIR), base);
+    let problem = if let Some(net) = network_prefixes.iter().find(|n| under(&dl, n)) {
         Some(format!("download_dir {dl} is on network mount {net}"))
-    } else if !complete.is_empty() && under(&dl, &complete) {
+    } else if under(&dl, &complete) {
         Some(format!(
             "download_dir {dl} is inside complete_dir {complete}"
         ))
@@ -216,5 +221,15 @@ download_dir = /bogus
             ..Dirs::default()
         };
         assert!(!assess(&dotted, DEFAULT_BASE, &["/downloads".into()]).ok);
+    }
+
+    #[test]
+    fn unset_dirs_take_sabnzbds_defaults() {
+        let s = assess(&parse_dirs("[misc]\ndownload_dir = \n"), "/config", &[]);
+        assert_eq!(s.download_dir, "/config/Downloads/incomplete");
+        assert_eq!(s.complete_dir, "/config/Downloads/complete");
+        assert!(s.ok);
+        let s = assess(&Dirs::default(), "/mnt/share/sab", &["/mnt/share".into()]);
+        assert!(s.problem.unwrap().contains("network mount"));
     }
 }
