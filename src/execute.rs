@@ -4,6 +4,10 @@
 //! the dry run can report the exact drift. Opting out of the central gate also
 //! opts out of the role check orca runs inside it, so [`require_admin`]
 //! replaces it, on the dry run too.
+//!
+//! Interim: once orca carries dry run centrally (`dryRun`, read as
+//! `ctx.dry_run()`, execute by default), tools drop their `execute` arg and
+//! keep this check.
 
 use plugin_toolkit::contract::CallerIdentity;
 use plugin_toolkit::prelude::*;

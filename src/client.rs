@@ -1,15 +1,24 @@
 //! SABnzbd API client: form-encoded POSTs to `/api`. The API key travels in
 //! the body (SABnzbd reads `apikey` from query or form, never a header), so it
 //! never appears in a URL or in an error that quotes one.
+//!
+//! Every error text passes through [`SabClient::scrub`]: the API key and any
+//! sensitive value seen in a `get_config` reply (server passwords) are replaced
+//! by exact match, then the stack-wide pattern scrub runs.
+
+use std::sync::Mutex;
 
 use plugin_toolkit::http::Client as HttpClient;
 use plugin_toolkit::prelude::*;
+use plugin_toolkit::scrub;
 use plugin_toolkit::serde_json::Value;
 
 pub struct SabClient {
     http: HttpClient,
     base: String,
     api_key: String,
+    /// Sensitive values seen in `get_config` replies.
+    seen_secrets: Mutex<Vec<String>>,
 }
 
 impl SabClient {
@@ -18,6 +27,7 @@ impl SabClient {
             http: HttpClient::new(),
             base: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
+            seen_secrets: Mutex::new(Vec::new()),
         }
     }
 
@@ -50,20 +60,60 @@ impl SabClient {
         Ok(v)
     }
 
-    /// `text` with the API key replaced, in case a server or transport error
-    /// echoes the request.
-    fn scrub(&self, text: &str) -> String {
-        if self.api_key.is_empty() {
-            return text.to_string();
+    /// `text` with every known secret replaced, in case a server or transport
+    /// error echoes the request or a config value.
+    pub fn scrub(&self, text: &str) -> String {
+        let mut out = text.to_string();
+        let seen = self.seen_secrets.lock().unwrap_or_else(|e| e.into_inner());
+        for secret in std::iter::once(&self.api_key).chain(seen.iter()) {
+            if !secret.is_empty() {
+                out = out.replace(secret.as_str(), scrub::REDACTED);
+            }
         }
-        text.replace(&self.api_key, "<redacted>")
+        plugin_toolkit::logging::scrub(&out).into_owned()
     }
 
-    pub async fn config_section(&self, section: &str) -> Result<Value> {
+    fn remember_secrets(&self, v: &Value) {
+        let mut found = Vec::new();
+        collect_secrets(v, &mut found);
+        if found.is_empty() {
+            return;
+        }
+        let mut seen = self.seen_secrets.lock().unwrap_or_else(|e| e.into_inner());
+        for f in found {
+            if !seen.contains(&f) {
+                seen.push(f);
+            }
+        }
+    }
+
+    /// One config section (`misc`, `servers`, ...). Unredacted: callers pick
+    /// the fields they report. Its sensitive values are scrubbed from every
+    /// later error of this client.
+    pub async fn get_config(&self, section: &str) -> Result<Value> {
         let v = self.api("get_config", &[("section", section)]).await?;
+        self.remember_secrets(&v);
         v.pointer(&format!("/config/{section}"))
             .cloned()
             .ok_or_else(|| anyhow!("sabnzbd get_config: no `{section}` section"))
+    }
+
+    /// Set `values` on `section`, scoped to the entry `keyword` names (a
+    /// server's name), or on the section itself when `keyword` is `None`
+    /// (e.g. `misc` with `("download_dir", ..)`).
+    pub async fn set_config(
+        &self,
+        section: &str,
+        keyword: Option<&str>,
+        values: &[(&str, &str)],
+    ) -> Result<()> {
+        let mut params = vec![("section", section)];
+        if let Some(k) = keyword {
+            params.push(("keyword", k));
+        }
+        params.extend_from_slice(values);
+        self.api("set_config", &params).await?;
+        Ok(())
     }
 
     /// Warning texts. Newer releases return objects with `text`, older plain strings.
@@ -85,16 +135,25 @@ impl SabClient {
 
     pub async fn set_server_connections(&self, server: &str, connections: u32) -> Result<()> {
         let n = connections.to_string();
-        self.api(
-            "set_config",
-            &[
-                ("section", "servers"),
-                ("keyword", server),
-                ("connections", &n),
-            ],
-        )
-        .await?;
-        Ok(())
+        self.set_config("servers", Some(server), &[("connections", &n)])
+            .await
+    }
+}
+
+fn collect_secrets(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::Object(m) => {
+            for (k, val) in m {
+                match val {
+                    Value::String(s) if !s.is_empty() && scrub::is_sensitive_key(k) => {
+                        out.push(s.clone())
+                    }
+                    _ => collect_secrets(val, out),
+                }
+            }
+        }
+        Value::Array(a) => a.iter().for_each(|x| collect_secrets(x, out)),
+        _ => {}
     }
 }
 
@@ -137,7 +196,7 @@ mod tests {
             .mount(&s)
             .await;
         let c = SabClient::new(&format!("{}/", s.uri()), "k y");
-        let misc = c.config_section("misc").await.unwrap();
+        let misc = c.get_config("misc").await.unwrap();
         assert_eq!(misc["download_dir"], "/incomplete");
         assert_eq!(c.warnings().await.unwrap(), vec!["old style", "new style"]);
         let err = c.set_server_connections("eweka", 20).await.unwrap_err();
@@ -168,6 +227,62 @@ mod tests {
             !err.contains("s3cr3t-key") && err.contains("<redacted>"),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn server_passwords_from_get_config_never_reach_errors() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api"))
+            .and(body_string_contains("mode=get_config"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"config": {"servers": [
+                    {"name": "eweka", "username": "u", "password": "hunter2-pw", "connections": 30}
+                ]}})),
+            )
+            .mount(&s)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api"))
+            .and(body_string_contains("mode=set_config"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    json!({"status": false, "error": "login failed with hunter2-pw"}),
+                ),
+            )
+            .mount(&s)
+            .await;
+        let c = SabClient::new(&s.uri(), "k");
+        let servers = c.get_config("servers").await.unwrap();
+        assert_eq!(servers[0]["password"], "hunter2-pw");
+        let err = c
+            .set_config("servers", Some("eweka"), &[("connections", "20")])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !err.contains("hunter2-pw") && err.contains("<redacted>"),
+            "{err}"
+        );
+        let req = s.received_requests().await.unwrap();
+        let body = String::from_utf8_lossy(&req[1].body);
+        assert!(body.contains("section=servers") && body.contains("keyword=eweka"));
+    }
+
+    #[tokio::test]
+    async fn non_json_replies_are_decode_errors() {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html>login</html>"))
+            .mount(&s)
+            .await;
+        let err = SabClient::new(&s.uri(), "k")
+            .warnings()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("sabnzbd warnings: decode"), "{err}");
     }
 
     #[tokio::test]

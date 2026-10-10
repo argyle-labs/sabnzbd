@@ -4,7 +4,7 @@
 //!
 //!   - `sabnzbd.incomplete.status`  whether `download_dir` (incomplete) is on local disk
 //!   - `sabnzbd.servers.status`     connections per news server against its account limit
-//!   - `sabnzbd.servers.sync`       lower connections to the declared limit (dry run by default)
+//!   - `sabnzbd.servers.sync`       lower connections to the declared limit (admin; dry run unless `execute`)
 //!   - `sabnzbd.warnings.status`    current warnings, classified, with known false positives marked
 
 use std::collections::BTreeMap;
@@ -86,7 +86,7 @@ async fn sabnzbd_incomplete_status(
 ) -> Result<IncompleteStatus> {
     match (args.name, args.ini_path) {
         (Some(name), None) => {
-            let misc = connect(&name).await?.config_section("misc").await?;
+            let misc = connect(&name).await?.get_config("misc").await?;
             let base = args
                 .base
                 .unwrap_or_else(|| incomplete::DEFAULT_BASE.to_string());
@@ -146,7 +146,7 @@ pub struct ServersStatusOutput {
 
 async fn server_statuses(c: &SabClient, limits: &[(String, u32)]) -> Result<Vec<ServerStatus>> {
     let limits: BTreeMap<String, u32> = limits.iter().cloned().collect();
-    let cfg = c.config_section("servers").await?;
+    let cfg = c.get_config("servers").await?;
     let warns = c.warnings().await?;
     Ok(servers::assess(&cfg, &limits, &warns))
 }
@@ -179,15 +179,30 @@ pub struct ServersSyncArgs {
 }
 
 #[orca_struct]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionChange {
+    pub name: String,
+    pub host: String,
+    pub from: u32,
+    pub to: u32,
+}
+
+#[orca_struct]
 pub struct ServersSyncOutput {
     /// Servers lowered (or to lower, on a dry run) to their limit.
-    pub lowered: Vec<ServerStatus>,
+    pub changes: Vec<ConnectionChange>,
+    /// Reasons the plan cannot be applied; non-empty refuses the execute.
+    pub refusals: Vec<String>,
     pub changed: bool,
     pub dry_run: bool,
 }
 
 /// Lower each server's connections to its declared limit. Servers under their
-/// limit are left alone. Verifies the write.
+/// limit are left alone. Verifies the write. Admin-only, dry run included.
+///
+/// The `execute` flag is interim: orca will carry dry run centrally as
+/// `dryRun` (`ctx.dry_run()`) with execute as the default, and this tool's
+/// one dry-run check swaps to it.
 #[orca_tool(
     domain = "sabnzbd",
     verb = "servers.sync",
@@ -196,55 +211,86 @@ pub struct ServersSyncOutput {
 )]
 async fn sabnzbd_servers_sync(args: ServersSyncArgs, ctx: &ToolCtx) -> Result<ServersSyncOutput> {
     execute::require_admin("sabnzbd.servers.sync", ctx)?;
+    // TODO(dry-run flag): becomes `ctx.dry_run()` and the `execute` arg goes.
+    let dry_run = !args.execute;
     let c = connect(&args.name).await?;
-    servers_sync(&c, &args.limits, args.execute).await
+    servers_sync(&c, &args.limits, dry_run).await
+}
+
+/// Changes that bring each over-limit server down to its limit, plus refusals:
+/// a limit naming no configured server (a typo would otherwise apply nothing
+/// silently).
+fn plan_servers(
+    statuses: &[ServerStatus],
+    limits: &[(String, u32)],
+) -> (Vec<ConnectionChange>, Vec<String>) {
+    let changes = statuses
+        .iter()
+        .filter(|s| s.over_limit)
+        .filter_map(|s| {
+            Some(ConnectionChange {
+                name: s.name.clone(),
+                host: s.host.clone(),
+                from: s.connections,
+                to: s.limit?,
+            })
+        })
+        .collect();
+    let refusals = limits
+        .iter()
+        .filter(|(k, _)| !statuses.iter().any(|s| &s.name == k || &s.host == k))
+        .map(|(k, _)| format!("limit `{k}` matches no configured server name or host"))
+        .collect();
+    (changes, refusals)
 }
 
 async fn servers_sync(
     c: &SabClient,
     limits: &[(String, u32)],
-    execute: bool,
+    dry_run: bool,
 ) -> Result<ServersSyncOutput> {
-    let lowered: Vec<ServerStatus> = server_statuses(c, limits)
+    let (changes, refusals) = plan_servers(&server_statuses(c, limits).await?, limits);
+    if dry_run || changes.is_empty() {
+        return Ok(ServersSyncOutput {
+            changes,
+            refusals,
+            changed: false,
+            dry_run,
+        });
+    }
+    if !refusals.is_empty() {
+        bail!("sabnzbd.servers.sync refused: {}", refusals.join("; "));
+    }
+    // Keep going past a failed server so one bad entry does not leave the
+    // rest unapplied; the error then says exactly which ones took.
+    let mut failed = Vec::new();
+    for ch in &changes {
+        if let Err(e) = c.set_server_connections(&ch.name, ch.to).await {
+            failed.push(format!("{}: {e}", ch.name));
+        }
+    }
+    let still: Vec<String> = server_statuses(c, limits)
         .await?
         .into_iter()
         .filter(|s| s.over_limit)
+        .map(|s| s.name)
         .collect();
-    let changed = execute && !lowered.is_empty();
-    if changed {
-        // Keep going past a failed server so one bad entry does not leave the
-        // rest unapplied; the error then says exactly which ones took.
-        let mut failed = Vec::new();
-        for s in &lowered {
-            if let Err(e) = c
-                .set_server_connections(&s.name, s.limit.unwrap_or(s.connections))
-                .await
-            {
-                failed.push(format!("{}: {e}", s.name));
-            }
-        }
-        let still: Vec<String> = server_statuses(c, limits)
-            .await?
-            .into_iter()
-            .filter(|s| s.over_limit)
-            .map(|s| s.name)
+    if !failed.is_empty() || !still.is_empty() {
+        let applied: Vec<&str> = changes
+            .iter()
+            .map(|ch| ch.name.as_str())
+            .filter(|n| !still.iter().any(|x| x == n))
             .collect();
-        if !failed.is_empty() || !still.is_empty() {
-            let applied: Vec<&str> = lowered
-                .iter()
-                .map(|s| s.name.as_str())
-                .filter(|n| !still.iter().any(|x| x == n))
-                .collect();
-            bail!(
-                "sabnzbd did not take the connection limit for {still:?} (applied: {applied:?}; errors: {})",
-                if failed.is_empty() { "none".to_string() } else { failed.join("; ") }
-            );
-        }
+        bail!(
+            "sabnzbd did not take the connection limit for {still:?} (applied: {applied:?}; errors: {})",
+            if failed.is_empty() { "none".to_string() } else { failed.join("; ") }
+        );
     }
     Ok(ServersSyncOutput {
-        lowered,
-        changed,
-        dry_run: !execute,
+        changes,
+        refusals,
+        changed: true,
+        dry_run,
     })
 }
 
@@ -359,10 +405,19 @@ mod tests {
             plugin_toolkit::serde_json::json!([]),
         )
         .await;
-        let r = servers_sync(&c, &[("eweka".into(), 20)], false)
+        let r = servers_sync(&c, &[("eweka".into(), 20), ("typo".into(), 5)], true)
             .await
             .unwrap();
-        assert_eq!(r.lowered.len(), 1);
+        assert_eq!(
+            r.changes,
+            vec![ConnectionChange {
+                name: "eweka".into(),
+                host: "news.eweka.nl".into(),
+                from: 30,
+                to: 20
+            }]
+        );
+        assert_eq!(r.refusals.len(), 1, "{:?}", r.refusals);
         assert!(!r.changed && r.dry_run);
         assert_eq!(set_calls(&s).await, 0);
     }
@@ -374,7 +429,7 @@ mod tests {
             plugin_toolkit::serde_json::json!([]),
         )
         .await;
-        let err = servers_sync(&c, &[("eweka".into(), 20)], true)
+        let err = servers_sync(&c, &[("eweka".into(), 20)], false)
             .await
             .err()
             .unwrap();
@@ -404,7 +459,7 @@ mod tests {
             .with_priority(1)
             .mount(&s)
             .await;
-        let err = servers_sync(&c, &[("a".into(), 20), ("b".into(), 20)], true)
+        let err = servers_sync(&c, &[("a".into(), 20), ("b".into(), 20)], false)
             .await
             .err()
             .unwrap()
@@ -414,7 +469,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn servers_sync_refuses_non_admins() {
+    async fn servers_sync_execute_is_refused_when_a_limit_matches_nothing() {
+        let (s, c) = sab(
+            plugin_toolkit::serde_json::json!([{"name": "eweka", "host": "news.eweka.nl", "connections": 30}]),
+            plugin_toolkit::serde_json::json!([]),
+        )
+        .await;
+        let err = servers_sync(&c, &[("eweka".into(), 20), ("typo".into(), 5)], false)
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("refused"), "{err}");
+        assert_eq!(set_calls(&s).await, 0);
+    }
+
+    #[tokio::test]
+    async fn servers_sync_refuses_non_admins_on_the_dry_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = ctx(dir.path());
+        ctx.set_caller(Some(plugin_toolkit::contract::CallerIdentity {
+            user_id: "u".into(),
+            username: "op".into(),
+            role: "user".into(),
+            can_mutate: true,
+        }));
+        let args = ServersSyncArgs {
+            name: "sab".into(),
+            limits: vec![],
+            execute: false,
+        };
+        let err = sabnzbd_servers_sync(args, &ctx).await.err().unwrap();
+        assert!(err.to_string().contains("requires role 'admin'"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn servers_sync_refuses_a_call_without_caller() {
         let dir = tempfile::tempdir().unwrap();
         let args = ServersSyncArgs {
             name: "sab".into(),
