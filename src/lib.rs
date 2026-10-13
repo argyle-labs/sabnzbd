@@ -14,8 +14,7 @@ pub mod tools;
 pub mod warnings;
 
 use plugin_toolkit::service::{
-    BoxFuture, Routes, Runtime, ServiceBackend, ServiceCapability, ServiceError, ServiceStatus,
-    WorkloadSpec,
+    BoxFuture, Routes, Runtime, ServiceBackend, ServiceError, ServiceStatus, WorkloadSpec,
 };
 
 /// sabnzbd backend. Holds only the provider name; per-instance endpoint/creds
@@ -41,16 +40,6 @@ impl ServiceBackend for SabnzbdBackend {
     /// drives pct/docker itself (that mechanic lives in the deploy-target domain).
     fn runtimes(&self) -> Vec<Runtime> {
         vec![Runtime::Docker, Runtime::Podman, Runtime::Lxc, Runtime::Vm]
-    }
-
-    fn capabilities(&self) -> Vec<ServiceCapability> {
-        vec![
-            ServiceCapability::Deploy,
-            ServiceCapability::Backup,
-            ServiceCapability::Restore,
-            ServiceCapability::Configure,
-            ServiceCapability::Status,
-        ]
     }
 
     fn default_port(&self) -> u16 {
