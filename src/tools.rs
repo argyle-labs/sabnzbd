@@ -1,8 +1,7 @@
 //! sabnzbd tools: the endpoint registry plus `incomplete`, `servers` and
-//! `warnings` diagnostics, and `servers.sync`.
+//! `warnings` diagnostics, and `incomplete.sync` and `servers.sync`.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::serde_json::Value;
@@ -38,16 +37,10 @@ async fn connect(name: &str) -> Result<SabClient> {
 
 #[orca_struct(args)]
 pub struct IncompleteStatusArgs {
-    /// Registered sabnzbd endpoint; its config is read over the API.
+    /// Registered sabnzbd endpoint name.
     #[arg(long)]
-    #[serde(default)]
-    pub name: Option<String>,
-    /// Path to `sabnzbd.ini` on this host, instead of `name`. Relative dirs
-    /// resolve against its directory.
-    #[arg(long)]
-    #[serde(default)]
-    pub ini_path: Option<String>,
-    /// Directory relative dirs resolve against with `name` (default `/config`).
+    pub name: String,
+    /// Directory relative dirs resolve against (default `/config`).
     #[arg(long)]
     #[serde(default)]
     pub base: Option<String>,
@@ -71,41 +64,137 @@ fn misc_dirs(misc: &Value) -> incomplete::Dirs {
 }
 
 /// Report whether SABnzbd's incomplete `download_dir` is local. Flags one under
-/// a `network_prefixes` mount or inside `complete_dir`. Takes exactly one of
-/// `name` or `ini_path`; reading a host file makes it admin-only. Read-only.
-#[orca_tool(domain = "sabnzbd", verb = "incomplete.status", role = "admin")]
+/// a `network_prefixes` mount or inside `complete_dir`. Read-only.
+#[orca_tool(domain = "sabnzbd", verb = "incomplete.status", role = "any")]
 async fn sabnzbd_incomplete_status(
     args: IncompleteStatusArgs,
     _ctx: &ToolCtx,
 ) -> Result<IncompleteStatus> {
-    match (args.name, args.ini_path) {
-        (Some(name), None) => {
-            let misc = connect(&name).await?.get_config("misc").await?;
-            let base = args
-                .base
-                .unwrap_or_else(|| incomplete::DEFAULT_BASE.to_string());
-            Ok(incomplete::assess(
-                &misc_dirs(&misc),
-                &base,
-                &args.network_prefixes,
-            ))
-        }
-        (None, Some(path)) => incomplete_from_file(&path, &args.network_prefixes),
-        _ => bail!("pass exactly one of name or ini_path"),
-    }
+    let misc = connect(&args.name).await?.get_config("misc").await?;
+    let base = args
+        .base
+        .unwrap_or_else(|| incomplete::DEFAULT_BASE.to_string());
+    Ok(incomplete::assess(
+        &misc_dirs(&misc),
+        &base,
+        &args.network_prefixes,
+    ))
 }
 
-fn incomplete_from_file(ini_path: &str, network_prefixes: &[String]) -> Result<IncompleteStatus> {
-    let ini = std::fs::read_to_string(ini_path).with_context(|| format!("read {ini_path}"))?;
-    let base = Path::new(ini_path)
-        .parent()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    Ok(incomplete::assess(
-        &incomplete::parse_dirs(&ini),
+#[orca_struct(args)]
+pub struct IncompleteSyncArgs {
+    /// Registered sabnzbd endpoint name.
+    #[arg(long)]
+    pub name: String,
+    /// Container path for incomplete downloads, backed by a local volume.
+    #[arg(long)]
+    pub download_dir: String,
+    /// Directory relative dirs resolve against (default `/config`).
+    #[arg(long)]
+    #[serde(default)]
+    pub base: Option<String>,
+    /// Container path of a network-backed mount (repeatable); a target under
+    /// one is refused.
+    #[arg(long = "network-prefix")]
+    #[serde(default)]
+    pub network_prefixes: Vec<String>,
+    /// Report drift and change nothing.
+    #[arg(long)]
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[orca_struct]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncompleteSyncOutput {
+    /// Resolved target.
+    pub target: String,
+    /// Resolved `download_dir` before this call.
+    pub download_dir: String,
+    pub in_sync: bool,
+    /// True only when this call wrote `download_dir`; a dry run never does.
+    pub changed: bool,
+    pub dry_run: bool,
+}
+
+/// **Remediation.** Set SABnzbd's incomplete `download_dir` through its
+/// `set_config` API so in-progress jobs stop writing to the network share;
+/// `complete_dir` stays on the library share. Refuses a target on a network
+/// mount or inside `complete_dir`. The volume behind it must already be mounted
+/// into the container. Idempotent; writes only on drift, then reads it back.
+#[orca_tool(
+    domain = "sabnzbd",
+    verb = "incomplete.sync",
+    role = "admin",
+    execute_gated = false
+)]
+async fn sabnzbd_incomplete_sync(
+    args: IncompleteSyncArgs,
+    ctx: &ToolCtx,
+) -> Result<IncompleteSyncOutput> {
+    execute::require_admin("sabnzbd.incomplete.sync", ctx)?;
+    let c = connect(&args.name).await?;
+    let base = args
+        .base
+        .unwrap_or_else(|| incomplete::DEFAULT_BASE.to_string());
+    incomplete_sync(
+        &c,
+        &args.download_dir,
         &base,
+        &args.network_prefixes,
+        args.dry_run,
+    )
+    .await
+}
+
+async fn incomplete_sync(
+    c: &SabClient,
+    target: &str,
+    base: &str,
+    network_prefixes: &[String],
+    dry_run: bool,
+) -> Result<IncompleteSyncOutput> {
+    if target.trim().is_empty() {
+        bail!("download_dir must not be empty");
+    }
+    let current = misc_dirs(&c.get_config("misc").await?);
+    let before = incomplete::assess(&current, base, network_prefixes);
+    let planned = incomplete::assess(
+        &incomplete::Dirs {
+            download_dir: target.to_string(),
+            complete_dir: current.complete_dir.clone(),
+        },
+        base,
         network_prefixes,
-    ))
+    );
+    if let Some(problem) = planned.problem {
+        bail!("sabnzbd.incomplete.sync refused: {problem}");
+    }
+    let in_sync = before.download_dir == planned.download_dir;
+    let changed = !dry_run && !in_sync;
+    if changed {
+        c.set_config("misc", None, &[("download_dir", target)])
+            .await?;
+        let after = incomplete::assess(
+            &misc_dirs(&c.get_config("misc").await?),
+            base,
+            network_prefixes,
+        );
+        if after.download_dir != planned.download_dir {
+            bail!(
+                "sabnzbd did not take download_dir {}: reads back {}",
+                planned.download_dir,
+                after.download_dir
+            );
+        }
+    }
+    Ok(IncompleteSyncOutput {
+        target: planned.download_dir,
+        download_dir: before.download_dir,
+        in_sync,
+        changed,
+        dry_run,
+    })
 }
 
 fn parse_limit(s: &str) -> std::result::Result<(String, u32), String> {
@@ -404,6 +493,7 @@ mod tests {
     use plugin_toolkit::contract::config::{Config, Model, Ports};
     use plugin_toolkit::contract::CallerIdentity;
     use plugin_toolkit::serde_json::json;
+    use std::path::Path;
     use std::sync::{Arc, Mutex};
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
@@ -739,28 +829,120 @@ mod tests {
         assert_eq!(d.download_dir, "Downloads/incomplete");
     }
 
-    #[test]
-    fn reads_ini_path_and_resolves_relative_dirs_beside_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let ini = dir.path().join("sabnzbd.ini");
-        std::fs::write(&ini, "[misc]\ndownload_dir = Downloads/incomplete\n").unwrap();
-        let base = dir.path().to_string_lossy().into_owned();
-        let s = incomplete_from_file(&ini.to_string_lossy(), std::slice::from_ref(&base)).unwrap();
-        assert_eq!(s.download_dir, format!("{base}/Downloads/incomplete"));
-        assert!(!s.ok);
+    /// Serves `misc`; `set_config` stores `download_dir` unless `ignore_writes`.
+    #[derive(Clone)]
+    struct Misc {
+        misc: Arc<Mutex<Value>>,
+        ignore_writes: bool,
+    }
+
+    impl Respond for Misc {
+        fn respond(&self, req: &Request) -> ResponseTemplate {
+            let ok = |v: Value| ResponseTemplate::new(200).set_body_json(v);
+            match form(req, "mode").as_deref() {
+                Some("get_config") => {
+                    ok(json!({"config": {"misc": self.misc.lock().unwrap().clone()}}))
+                }
+                Some("set_config") => {
+                    assert_eq!(form(req, "section").as_deref(), Some("misc"));
+                    assert!(form(req, "keyword").is_none());
+                    if !self.ignore_writes {
+                        let v = form(req, "download_dir").unwrap().replace("%2F", "/");
+                        self.misc.lock().unwrap()["download_dir"] = json!(v);
+                    }
+                    ok(json!({"status": true}))
+                }
+                _ => ResponseTemplate::new(404),
+            }
+        }
+    }
+
+    async fn serve_misc(download_dir: &str, ignore_writes: bool) -> (MockServer, SabClient) {
+        let s = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api"))
+            .respond_with(Misc {
+                misc: Arc::new(Mutex::new(
+                    json!({"download_dir": download_dir, "complete_dir": "/downloads/complete"}),
+                )),
+                ignore_writes,
+            })
+            .mount(&s)
+            .await;
+        let c = SabClient::new(&s.uri(), "k");
+        (s, c)
+    }
+
+    fn net() -> Vec<String> {
+        vec!["/downloads".into()]
     }
 
     #[tokio::test]
-    async fn incomplete_status_needs_exactly_one_source() {
+    async fn incomplete_sync_dry_run_reports_without_writing() {
+        let (s, c) = serve_misc("/downloads/incomplete", false).await;
+        let r = incomplete_sync(&c, "/incomplete", "/config", &net(), true)
+            .await
+            .unwrap();
+        assert!(!r.in_sync && !r.changed && r.dry_run);
+        assert_eq!(r.download_dir, "/downloads/incomplete");
+        assert_eq!(set_calls(&s).await, 0);
+    }
+
+    #[tokio::test]
+    async fn incomplete_sync_execute_writes_and_reads_back() {
+        let (s, c) = serve_misc("/downloads/incomplete", false).await;
+        let r = incomplete_sync(&c, "/incomplete", "/config", &net(), false)
+            .await
+            .unwrap();
+        assert!(r.changed && !r.dry_run);
+        assert_eq!(r.target, "/incomplete");
+        assert_eq!(set_calls(&s).await, 1);
+        let r = incomplete_sync(&c, "/incomplete/", "/config", &net(), false)
+            .await
+            .unwrap();
+        assert!(r.in_sync && !r.changed);
+        assert_eq!(set_calls(&s).await, 1);
+    }
+
+    #[tokio::test]
+    async fn incomplete_sync_fails_when_the_write_does_not_take() {
+        let (_s, c) = serve_misc("/downloads/incomplete", true).await;
+        let err = incomplete_sync(&c, "/incomplete", "/config", &net(), false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("did not take"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn incomplete_sync_refuses_network_and_complete_dir_targets() {
+        let (s, c) = serve_misc("/downloads/incomplete", false).await;
+        for (target, prefixes, want) in [
+            ("/downloads/inc", net(), "network mount"),
+            ("/downloads/complete/inc", vec![], "inside complete_dir"),
+            (" ", vec![], "must not be empty"),
+        ] {
+            let err = incomplete_sync(&c, target, "/config", &prefixes, false)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(want), "{target}: {err}");
+        }
+        assert_eq!(set_calls(&s).await, 0);
+    }
+
+    #[tokio::test]
+    async fn incomplete_sync_refuses_non_admins_on_the_dry_run() {
         let dir = tempfile::tempdir().unwrap();
-        let args = IncompleteStatusArgs {
-            name: Some("sab".into()),
-            ini_path: Some("/x".into()),
+        let args = IncompleteSyncArgs {
+            name: "sab".into(),
+            download_dir: "/incomplete".into(),
             base: None,
             network_prefixes: vec![],
+            dry_run: true,
         };
-        assert!(sabnzbd_incomplete_status(args, &ctx(dir.path()))
+        let err = sabnzbd_incomplete_sync(args, &ctx(dir.path()))
             .await
-            .is_err());
+            .unwrap_err();
+        assert!(err.to_string().contains("no caller identity"), "{err}");
     }
 }
