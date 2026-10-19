@@ -25,14 +25,9 @@ async fn connect(name: &str) -> Result<SabClient> {
     if !row.enabled {
         bail!("sabnzbd endpoint '{name}' is disabled");
     }
-    let api_key = plugin_toolkit::secrets::resolve_scoped(
-        "sabnzbd",
-        name,
-        "api_key",
-        (!row.api_key.is_empty()).then_some(row.api_key.as_str()),
-    )?;
+    let api_key = plugin_toolkit::secrets::resolve_scoped("sabnzbd", name, "api_key")?;
     let base_url = route::resolve_reachable(name, &row.routes, false).await?;
-    Ok(SabClient::new(&base_url, &api_key))
+    Ok(SabClient::new(&base_url, api_key.expose_secret()))
 }
 
 #[orca_struct(args)]
