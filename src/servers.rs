@@ -84,6 +84,7 @@ pub fn assess(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerProbe {
     pub name: String,
+    pub host: String,
     pub configured: u32,
     pub active: u32,
     pub error: String,
@@ -91,14 +92,27 @@ pub struct ServerProbe {
     pub observed_cap: Option<u32>,
 }
 
-pub fn probe(status: &Value) -> Vec<ServerProbe> {
+fn configured_server<'a>(servers: &'a Value, servername: &str) -> Option<&'a Value> {
+    let field = |s: &'a Value, k: &str| s.get(k).and_then(Value::as_str).unwrap_or("");
+    let all = servers.as_array()?;
+    ["displayname", "name", "host"].iter().find_map(|k| {
+        all.iter()
+            .find(|s| !field(s, k).is_empty() && field(s, k).eq_ignore_ascii_case(servername))
+    })
+}
+
+pub fn probe(status: &Value, servers: &Value) -> Vec<ServerProbe> {
     status
         .pointer("/status/servers")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(|s| {
-            let name = s.get("servername")?.as_str()?.to_string();
+            let servername = s.get("servername")?.as_str()?;
+            let cfg = configured_server(servers, servername);
+            let cfg_str = |k: &str| cfg.and_then(|c| c.get(k)).and_then(Value::as_str);
+            let name = cfg_str("name").unwrap_or(servername).to_string();
+            let host = cfg_str("host").unwrap_or("").to_string();
             let configured = s.get("servertotalconn").and_then(as_u32).unwrap_or(0);
             let active = s.get("serveractiveconn").and_then(as_u32).unwrap_or(0);
             let error = s
@@ -110,6 +124,7 @@ pub fn probe(status: &Value) -> Vec<ServerProbe> {
             Some(ServerProbe {
                 observed_cap: (limit_error && active > 0 && active < configured).then_some(active),
                 name,
+                host,
                 configured,
                 active,
                 error,
@@ -175,19 +190,32 @@ mod tests {
     #[test]
     fn probe_reports_an_observed_cap_only_under_a_limit_error() {
         let status = json!({"status": {"servers": [
-            {"servername": "eweka", "servertotalconn": 30, "serveractiveconn": 20,
+            {"servername": "Eweka", "servertotalconn": 30, "serveractiveconn": 20,
              "servererror": "502 Too many connections"},
             {"servername": "nh", "servertotalconn": "60", "serveractiveconn": 60, "servererror": ""},
             {"servername": "idle", "servertotalconn": 8, "serveractiveconn": 0,
              "servererror": "Too many connections"}
         ]}});
-        let p = probe(&status);
+        let servers = json!([
+            {"name": "news.eweka.nl", "displayname": "Eweka", "host": "news.eweka.nl"},
+            {"name": "nh", "displayname": "", "host": "news.newshosting.com"}
+        ]);
+        let p = probe(&status, &servers);
         assert_eq!((p[0].limit_error, p[0].observed_cap), (true, Some(20)));
+        assert_eq!(
+            (p[0].name.as_str(), p[0].host.as_str()),
+            ("news.eweka.nl", "news.eweka.nl")
+        );
+        assert_eq!(
+            (p[1].name.as_str(), p[1].host.as_str()),
+            ("nh", "news.newshosting.com")
+        );
+        assert_eq!((p[2].name.as_str(), p[2].host.as_str()), ("idle", ""));
         assert_eq!(
             (p[1].configured, p[1].active, p[1].observed_cap),
             (60, 60, None)
         );
         assert_eq!((p[2].limit_error, p[2].observed_cap), (true, None));
-        assert!(probe(&json!({})).is_empty());
+        assert!(probe(&json!({}), &servers).is_empty());
     }
 }
