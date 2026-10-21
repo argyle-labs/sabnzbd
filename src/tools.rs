@@ -1,5 +1,6 @@
 //! sabnzbd tools: the endpoint registry plus `incomplete`, `servers` and
-//! `warnings` diagnostics, and `incomplete.sync` and `servers.sync`.
+//! `warnings` diagnostics, the `servers.probe` live connection probe, and
+//! `incomplete.sync` and `servers.sync`.
 
 use std::collections::BTreeMap;
 
@@ -9,7 +10,7 @@ use plugin_toolkit::serde_json::Value;
 use crate::client::{self, SabClient};
 use crate::execute;
 use crate::incomplete::{self, IncompleteStatus};
-use crate::servers::{self, ServerStatus};
+use crate::servers::{self, ServerProbe, ServerStatus};
 use crate::warnings::{self, ClassifiedWarning};
 
 #[endpoint_resource(plugin = "sabnzbd")]
@@ -239,6 +240,34 @@ async fn sabnzbd_servers_status(
     let c = connect(&args.name).await?;
     Ok(ServersStatusOutput {
         servers: server_statuses(&c, &args.limits).await?,
+    })
+}
+
+#[orca_struct(args)]
+pub struct ServersProbeArgs {
+    /// Registered sabnzbd endpoint name.
+    #[arg(long)]
+    pub name: String,
+}
+
+#[orca_struct]
+pub struct ServersProbeOutput {
+    pub servers: Vec<ServerProbe>,
+}
+
+/// Live per-server connections from SABnzbd's status: configured vs active,
+/// the server's current error, and, while that error reports too many
+/// connections, the active count as the provider's observed cap (a value for
+/// `servers.sync --limit`). Read-only; probe while downloads are running.
+#[orca_tool(domain = "sabnzbd", verb = "servers.probe", role = "any")]
+async fn sabnzbd_servers_probe(
+    args: ServersProbeArgs,
+    _ctx: &ToolCtx,
+) -> Result<ServersProbeOutput> {
+    let c = connect(&args.name).await?;
+    let status = c.api("status", &[("skip_dashboard", "1")]).await?;
+    Ok(ServersProbeOutput {
+        servers: servers::probe(&status),
     })
 }
 
