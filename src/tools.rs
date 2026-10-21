@@ -266,8 +266,9 @@ async fn sabnzbd_servers_probe(
 ) -> Result<ServersProbeOutput> {
     let c = connect(&args.name).await?;
     let status = c.api("status", &[("skip_dashboard", "1")]).await?;
+    let cfg = c.get_config("servers").await?;
     Ok(ServersProbeOutput {
-        servers: servers::probe(&status),
+        servers: servers::probe(&status, &cfg),
     })
 }
 
