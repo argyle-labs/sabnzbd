@@ -80,6 +80,45 @@ pub fn assess(
         .collect()
 }
 
+#[orca_struct]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerProbe {
+    pub name: String,
+    pub configured: u32,
+    pub active: u32,
+    pub error: String,
+    pub limit_error: bool,
+    pub observed_cap: Option<u32>,
+}
+
+pub fn probe(status: &Value) -> Vec<ServerProbe> {
+    status
+        .pointer("/status/servers")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|s| {
+            let name = s.get("servername")?.as_str()?.to_string();
+            let configured = s.get("servertotalconn").and_then(as_u32).unwrap_or(0);
+            let active = s.get("serveractiveconn").and_then(as_u32).unwrap_or(0);
+            let error = s
+                .get("servererror")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let limit_error = is_limit_warning(&error);
+            Some(ServerProbe {
+                observed_cap: (limit_error && active > 0 && active < configured).then_some(active),
+                name,
+                configured,
+                active,
+                error,
+                limit_error,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,5 +170,24 @@ mod tests {
     fn oversized_connection_counts_do_not_wrap() {
         assert_eq!(as_u32(&json!(4_294_967_296u64)), None);
         assert_eq!(as_u32(&json!(" 20 ")), Some(20));
+    }
+
+    #[test]
+    fn probe_reports_an_observed_cap_only_under_a_limit_error() {
+        let status = json!({"status": {"servers": [
+            {"servername": "eweka", "servertotalconn": 30, "serveractiveconn": 20,
+             "servererror": "502 Too many connections"},
+            {"servername": "nh", "servertotalconn": "60", "serveractiveconn": 60, "servererror": ""},
+            {"servername": "idle", "servertotalconn": 8, "serveractiveconn": 0,
+             "servererror": "Too many connections"}
+        ]}});
+        let p = probe(&status);
+        assert_eq!((p[0].limit_error, p[0].observed_cap), (true, Some(20)));
+        assert_eq!(
+            (p[1].configured, p[1].active, p[1].observed_cap),
+            (60, 60, None)
+        );
+        assert_eq!((p[2].limit_error, p[2].observed_cap), (true, None));
+        assert!(probe(&json!({})).is_empty());
     }
 }
